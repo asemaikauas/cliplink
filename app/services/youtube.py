@@ -8,7 +8,7 @@ from moviepy import VideoFileClip
 
 # Import vertical cropping service
 try:
-    from .vertical_crop import crop_video_to_vertical, get_available_resolutions
+    from .vertical_crop import crop_video_to_vertical
     VERTICAL_CROP_AVAILABLE = True
     print("✅ Vertical cropping service loaded")
 except ImportError as e:
@@ -515,122 +515,89 @@ def cut_clips(video_path: Path, analysis: Dict) -> List[Path]:
     return created_clips
 
 
-def cut_clips_vertical(video_path: Path, analysis: Dict, resolution: str = "shorts_hd", smoothing_strength: str = "medium") -> List[Path]:
+def cut_clips_vertical(video_path: Path, analysis: Dict, smoothing_strength: str = "very_high") -> List[Path]:
     """
-    Cut clips from video and convert them to vertical format (9:16) for YouTube Shorts.
-    This combines the clip cutting functionality with vertical cropping.
-    Enhanced with motion smoothing to prevent jerky head movements.
-    
+    Cuts a video into vertical clips based on analysis, with motion smoothing.
+
     Args:
-        video_path: Path to the source video
-        analysis: Gemini analysis with viral segments
-        resolution: Target resolution ("shorts_hd", "shorts_fhd", "tiktok")
-        smoothing_strength: Motion smoothing level ("low", "medium", "high")
+        video_path: Path to the source video file.
+        analysis: Dictionary containing viral segments from Gemini.
+        smoothing_strength: Motion smoothing level.
     
     Returns:
-        List of paths to created vertical clips
+        A list of paths to the created vertical clips.
     """
     if not VERTICAL_CROP_AVAILABLE:
-        print("❌ Vertical cropping not available. Using standard clipping.")
-        return cut_clips(video_path, analysis)
-    
-    clips_dir = Path("clips")
-    clips_dir.mkdir(exist_ok=True)
-    
-    # Create vertical clips directory
-    vertical_clips_dir = clips_dir / "vertical"
-    vertical_clips_dir.mkdir(exist_ok=True)
-    
-    # Extract viral segments from analysis
-    gemini_analysis = analysis.get("gemini_analysis", {})
-    viral_segments = gemini_analysis.get("viral_segments", [])
-    
-    if not viral_segments:
-        logging.warning("No viral segments found in analysis")
+        print("❌ Vertical cropping service not available, cannot create vertical clips")
         return []
     
+    video_path = Path(video_path)
     if not video_path.exists():
-        raise FileNotFoundError(f"Video file not found: {video_path}")
+        print(f"❌ Video file not found: {video_path}")
+        return []
     
-    print(f"🎬 Creating {len(viral_segments)} vertical clips from {video_path.name}")
-    print(f"📱 Target resolution: {resolution}")
+    viral_segments = analysis.get("gemini_analysis", {}).get("viral_segments", [])
+    if not viral_segments:
+        print("❌ No viral segments found in analysis")
+        return []
+        
+    clips_dir = Path("clips") / "vertical"
+    clips_dir.mkdir(parents=True, exist_ok=True)
     
     created_clips = []
-    skipped_clips = []
-    failed_clips = []
     
-    # Get resolution info
-    resolutions = get_available_resolutions()
-    target_size = resolutions.get(resolution, resolutions["shorts_hd"])
-    print(f"🎯 Output size: {target_size[0]}x{target_size[1]}")
+    print(f"\n📱 Creating {len(viral_segments)} vertical clips...")
     
-    # First, create regular clips using existing functionality
-    print("\n📹 Step 1: Creating horizontal clips...")
-    horizontal_clips = cut_clips(video_path, analysis)
-    
-    print(f"\n🔄 Step 2: Converting {len(horizontal_clips)} clips to vertical format...")
-    
-    for i, horizontal_clip_path in enumerate(horizontal_clips):
-        clip_id = i + 1
+    for i, segment in enumerate(viral_segments):
+        start_time = segment.get("start")
+        end_time = segment.get("end")
+        
+        if start_time is None or end_time is None:
+            continue
+
+        base_name = _sanitize_filename(segment.get("title", f"segment_{i+1}"))
+        
+        # Create a temporary horizontal clip first
+        temp_horizontal_clip_path = clips_dir / f"temp_{base_name}.mp4"
         
         try:
-            # Get the base filename without extension
-            base_name = horizontal_clip_path.stem
-            vertical_clip_filename = f"{base_name}_vertical.mp4"
-            vertical_clip_path = vertical_clips_dir / vertical_clip_filename
+            print(f"  ➡️  Step 1/2: Cutting horizontal segment: '{base_name}' ({start_time}-{end_time})")
             
-            print(f"\n--- Converting Clip {clip_id}: {base_name} ---")
-            print(f"📂 Input: {horizontal_clip_path.name}")
-            print(f"📱 Output: {vertical_clip_filename}")
-            
-            # Convert to vertical format
-            success = crop_video_to_vertical(
-                input_path=horizontal_clip_path,
+            # Use direct ffmpeg for robust cutting
+            success = create_clip_with_direct_ffmpeg(
+                video_path, start_time, end_time, temp_horizontal_clip_path
+            )
+
+            if not success or not temp_horizontal_clip_path.exists():
+                print(f"      ❌ Failed to cut horizontal segment")
+                continue
+
+            # Now, create vertical crop from the temporary clip
+            vertical_clip_path = clips_dir / f"{base_name}_vertical.mp4"
+            print(f"  🔄  Step 2/2: Converting to vertical format...")
+
+            crop_success = crop_video_to_vertical(
+                input_path=temp_horizontal_clip_path,
                 output_path=vertical_clip_path,
-                resolution=resolution,
                 use_speaker_detection=True,
                 smoothing_strength=smoothing_strength
             )
-            
-            if success and vertical_clip_path.exists():
-                file_size = vertical_clip_path.stat().st_size
-                if file_size > 0:
-                    file_size_mb = file_size / (1024*1024)
-                    print(f"✅ Vertical clip created: {vertical_clip_filename} ({file_size_mb:.1f} MB)")
-                    created_clips.append(vertical_clip_path.absolute())
-                    
-                    # Optionally remove horizontal clip to save space
-                    # horizontal_clip_path.unlink()
-                    
-                else:
-                    reason = "Generated vertical file is empty (0 bytes)"
-                    print(f"❌ ОШИБКА clip {clip_id}: {reason}")
-                    vertical_clip_path.unlink()  # Delete empty file
-                    failed_clips.append({"clip_id": clip_id, "title": base_name, "reason": reason})
+
+            if crop_success:
+                print(f"      ✅ Vertical clip created: {vertical_clip_path.name}")
+                created_clips.append(vertical_clip_path)
             else:
-                reason = "Vertical cropping failed"
-                print(f"❌ ОШИБКА clip {clip_id}: {reason}")
-                failed_clips.append({"clip_id": clip_id, "title": base_name, "reason": reason})
-                
+                print(f"      ❌ Failed to create vertical crop for '{base_name}'")
+
         except Exception as e:
-            reason = f"Exception during vertical conversion: {str(e)}"
-            print(f"❌ ОШИБКА clip {clip_id}: {reason}")
-            failed_clips.append({"clip_id": clip_id, "title": "unknown", "reason": reason})
-            continue
-    
-    # Detailed summary
-    print(f"\n🎉 VERTICAL CONVERSION RESULTS:")
-    print(f"✅ Created vertical clips: {len(created_clips)}")
-    print(f"📊 Success rate: {len(created_clips)}/{len(horizontal_clips)}")
-    print(f"🎯 Resolution: {target_size[0]}x{target_size[1]} ({resolution})")
-    
-    if failed_clips:
-        print(f"\n❌ FAILED CONVERSIONS:")
-        for fail in failed_clips:
-            print(f"  - Clip {fail['clip_id']} ({fail['title']}): {fail['reason']}")
-    
-    print(f"\n📁 Vertical clips saved to: {vertical_clips_dir}")
-    
+            print(f"  ❌ Error processing segment '{base_name}': {e}")
+        
+        finally:
+            # Clean up the temporary horizontal clip
+            if temp_horizontal_clip_path.exists():
+                os.remove(temp_horizontal_clip_path)
+
+    print(f"\n✅ Vertical clip creation complete: {len(created_clips)} clips created.")
     return created_clips
 
 

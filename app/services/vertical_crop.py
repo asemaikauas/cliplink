@@ -25,13 +25,6 @@ class VerticalCropService:
     """
     
     def __init__(self):
-        # YouTube Shorts standard resolutions
-        self.RESOLUTIONS = {
-            "shorts_hd": (608, 1080),    # HD Shorts
-            "shorts_fhd": (1080, 1920),  # Full HD Shorts
-            "tiktok": (540, 960),        # TikTok format
-        }
-        
         # Initialize VAD for voice activity detection
         try:
             self.vad = webrtcvad.Vad(2)  # Aggressiveness mode 0-3
@@ -336,9 +329,8 @@ class VerticalCropService:
         self, 
         input_video_path: Path, 
         output_video_path: Path,
-        resolution: str = "shorts_hd",
         use_speaker_detection: bool = True,
-        smoothing_strength: str = "medium"
+        smoothing_strength: str = "very_high"
     ) -> bool:
         """
         Create a vertically cropped version of the video
@@ -346,20 +338,36 @@ class VerticalCropService:
         Args:
             input_video_path: Path to input video
             output_video_path: Path to save cropped video
-            resolution: Target resolution preset
             use_speaker_detection: Whether to use speaker detection for smart cropping
-            smoothing_strength: Motion smoothing level ("low", "medium", "high")
+            smoothing_strength: Motion smoothing level ("low", "medium", "high", "very_high")
         """
         try:
-            if resolution not in self.RESOLUTIONS:
-                logger.error(f"Unsupported resolution: {resolution}")
+            # Open video early to get properties
+            cap = cv2.VideoCapture(str(input_video_path))
+            if not cap.isOpened():
+                logger.error(f"Could not open video: {input_video_path}")
                 return False
             
+            original_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+            original_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+            fps = int(cap.get(cv2.CAP_PROP_FPS))
+            total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+            cap.release() # Release now, will be reopened for processing
+
+            # Calculate 9:16 width based on original height
+            target_height = original_height
+            target_width = int(original_height * (9 / 16))
+            # Ensure width is even for compatibility
+            if target_width % 2 != 0:
+                target_width += 1
+            target_size = (target_width, target_height)
+
             # 🎛️ КОНФИГУРАЦИЯ СГЛАЖИВАНИЯ
             smoothing_configs = {
                 "low": {"smoothing_factor": 0.3, "max_jump_distance": 80, "stability_frames": 3},
                 "medium": {"smoothing_factor": 0.75, "max_jump_distance": 50, "stability_frames": 5},
-                "high": {"smoothing_factor": 0.9, "max_jump_distance": 25, "stability_frames": 8}
+                "high": {"smoothing_factor": 0.9, "max_jump_distance": 25, "stability_frames": 8},
+                "very_high": {"smoothing_factor": 0.95, "max_jump_distance": 15, "stability_frames": 12}
             }
             
             if smoothing_strength in smoothing_configs:
@@ -376,7 +384,6 @@ class VerticalCropService:
                 self.max_jump_distance = config["max_jump_distance"]
                 self.stability_frames = config["stability_frames"]
             
-            target_size = self.RESOLUTIONS[resolution]
             logger.info(f"🎬 Creating STABILIZED vertical crop: {target_size[0]}x{target_size[1]}")
             
             # 🎯 СБРАСЫВАЕМ СОСТОЯНИЕ СТАБИЛИЗАЦИИ ДЛЯ НОВОГО ВИДЕО
@@ -389,15 +396,11 @@ class VerticalCropService:
                 audio_data = self.extract_audio_for_vad(input_video_path)
                 logger.info("🔊 Audio extracted for voice activity detection")
             
-            # Open video
+            # Open video for processing
             cap = cv2.VideoCapture(str(input_video_path))
             if not cap.isOpened():
                 logger.error(f"Could not open video: {input_video_path}")
                 return False
-            
-            # Get video properties
-            fps = int(cap.get(cv2.CAP_PROP_FPS))
-            total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
             
             # Setup video writer for a temporary, silent video file
             temp_video_path = output_video_path.with_name(f"{output_video_path.stem}_temp.mp4")
@@ -472,6 +475,8 @@ class VerticalCropService:
                     str(output_video_path), 
                     codec='libx264', 
                     audio_codec='aac',
+                    preset='slow',
+                    ffmpeg_params=['-crf', '18'],
                     logger=None
                 )
 
@@ -508,9 +513,8 @@ vertical_crop_service = VerticalCropService()
 def crop_video_to_vertical(
     input_path: Path, 
     output_path: Path, 
-    resolution: str = "shorts_hd",
     use_speaker_detection: bool = True,
-    smoothing_strength: str = "medium"
+    smoothing_strength: str = "very_high"
 ) -> bool:
     """
     Convenience function to crop a video to vertical format with motion smoothing
@@ -518,24 +522,19 @@ def crop_video_to_vertical(
     Args:
         input_path: Path to input video
         output_path: Path to save cropped video
-        resolution: Target resolution preset
         use_speaker_detection: Whether to use speaker detection for smart cropping
         smoothing_strength: Motion smoothing level:
             - "low": Минимальное сглаживание (быстрая реакция, factor=0.3, jump=80px)
             - "medium": Среднее сглаживание (баланс, factor=0.75, jump=50px) 
             - "high": Максимальное сглаживание (очень плавно, factor=0.9, jump=25px)
+            - "very_high": Экстремальное сглаживание (максимально плавно, factor=0.95, jump=15px)
     """
     return vertical_crop_service.create_vertical_crop(
         input_path, 
         output_path, 
-        resolution, 
         use_speaker_detection, 
         smoothing_strength
     )
-
-def get_available_resolutions() -> dict:
-    """Get available resolution presets"""
-    return vertical_crop_service.RESOLUTIONS.copy()
 
 def process_video_to_vertical_shorts(input_video_path, output_video_path, target_width=608, target_height=1080):
     """

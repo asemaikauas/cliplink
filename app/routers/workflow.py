@@ -14,6 +14,7 @@ from app.services.youtube import (
 )
 from app.services.transcript import fetch_youtube_transcript, extract_full_transcript
 from app.services.gemini import analyze_transcript_with_gemini
+from app.services.vertical_crop import crop_video_to_vertical
 
 router = APIRouter()
 
@@ -21,8 +22,7 @@ class ProcessVideoRequest(BaseModel):
     youtube_url: str
     quality: Optional[str] = "best"  # best, 8k, 4k, 1440p, 1080p, 720p
     create_vertical: Optional[bool] = False  # Create vertical (9:16) clips
-    vertical_resolution: Optional[str] = "shorts_hd"  # shorts_hd, shorts_fhd, tiktok
-    smoothing_strength: Optional[str] = "medium"  # low, medium, high - control head movement smoothing
+    smoothing_strength: Optional[str] = "very_high"  # low, medium, high, very_high
 
 class VideoInfoRequest(BaseModel):
     youtube_url: str
@@ -114,12 +114,11 @@ async def process_video_complete(request: ProcessVideoRequest):
         print(f"\n✂️ Step 4: Cutting video into clips...")
         try:
             if request.create_vertical:
-                print(f"📱 Creating vertical clips in {request.vertical_resolution} resolution")
+                print(f"📱 Creating vertical clips in native resolution")
                 print(f"🎛️ Smoothing level: {request.smoothing_strength}")
                 clip_paths = cut_clips_vertical(
                     video_path, 
                     gemini_analysis, 
-                    request.vertical_resolution,
                     smoothing_strength=request.smoothing_strength
                 )
             else:
@@ -172,7 +171,7 @@ async def process_video_complete(request: ProcessVideoRequest):
                 "clips_created": len(clip_paths),
                 "clip_paths": [str(p) for p in clip_paths],
                 "clip_type": "vertical" if request.create_vertical else "horizontal",
-                "resolution": request.vertical_resolution if request.create_vertical else "original"
+                "resolution": "native" if request.create_vertical else "original"
             }
         }
         
@@ -262,289 +261,121 @@ class VerticalCropRequest(BaseModel):
     """Request for creating vertical crops from existing video"""
     video_path: str
     output_path: Optional[str] = None
-    resolution: Optional[str] = "shorts_hd"  # shorts_hd, shorts_fhd, tiktok
     use_speaker_detection: Optional[bool] = True
-    smoothing_strength: Optional[str] = "medium"  # low, medium, high - control head movement smoothing
+    smoothing_strength: Optional[str] = "very_high"  # low, medium, high, very_high
 
 @router.post("/create-vertical-crop")
 async def create_vertical_crop(request: VerticalCropRequest):
     """
-    Create a vertical (9:16) crop from an existing video file
+    Create a vertically cropped version of an existing video file
     """
     try:
-        # Import inside function to handle potential import errors
-        from app.services.vertical_crop import crop_video_to_vertical, get_available_resolutions
+        source_path = Path(request.video_path)
+        if not source_path.exists():
+            raise HTTPException(status_code=404, detail="Source video not found")
         
-        video_path = Path(request.video_path)
-        if not video_path.exists():
-            raise HTTPException(status_code=404, detail=f"Video file not found: {request.video_path}")
-        
-        # Generate output path if not provided
         if request.output_path:
             output_path = Path(request.output_path)
         else:
-            # Create output in vertical subfolder
-            clips_dir = Path("clips") / "vertical"
-            clips_dir.mkdir(parents=True, exist_ok=True)
-            base_name = video_path.stem
-            output_path = clips_dir / f"{base_name}_vertical.mp4"
+            output_path = source_path.with_name(f"{source_path.stem}_vertical.mp4")
         
-        # Get available resolutions
-        resolutions = get_available_resolutions()
-        if request.resolution not in resolutions:
-            raise HTTPException(
-                status_code=400, 
-                detail=f"Invalid resolution. Available: {list(resolutions.keys())}"
-            )
-        
-        print(f"📱 Creating vertical crop:")
-        print(f"   Input: {video_path}")
-        print(f"   Output: {output_path}")
-        print(f"   Resolution: {request.resolution}")
-        print(f"   Speaker detection: {request.use_speaker_detection}")
-        print(f"   Smoothing: {request.smoothing_strength}")
-        
-        # Create vertical crop
+        print(f"🎬 Creating vertical crop for: {source_path}")
+        print(f"💾 Saving to: {output_path}")
+        print(f"🎛️ Smoothing: {request.smoothing_strength}")
+
         success = crop_video_to_vertical(
-            input_path=video_path,
-            output_path=output_path,
-            resolution=request.resolution,
+            source_path,
+            output_path,
             use_speaker_detection=request.use_speaker_detection,
             smoothing_strength=request.smoothing_strength
         )
         
-        if success and output_path.exists():
-            file_size_mb = output_path.stat().st_size / (1024*1024)
-            target_size = resolutions[request.resolution]
+        if not success:
+            raise HTTPException(status_code=500, detail="Failed to create vertical crop")
             
-            return {
-                "success": True,
-                "input_path": str(video_path),
-                "output_path": str(output_path),
-                "resolution": request.resolution,
-                "target_size": f"{target_size[0]}x{target_size[1]}",
-                "file_size_mb": round(file_size_mb, 1),
-                "speaker_detection_used": request.use_speaker_detection
-            }
-        else:
-            raise HTTPException(status_code=500, detail="Vertical crop creation failed")
+        return {
+            "success": True,
+            "output_path": str(output_path)
+        }
     
-    except ImportError:
-        raise HTTPException(
-            status_code=503, 
-            detail="Vertical cropping service not available. Install required dependencies."
-        )
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Vertical crop failed: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Failed to create vertical crop: {str(e)}")
 
-@router.get("/vertical-resolutions")
-async def get_vertical_resolutions():
-    """
-    Get available vertical video resolutions for cropping
-    """
-    try:
-        from app.services.vertical_crop import get_available_resolutions
-        
-        resolutions = get_available_resolutions()
-        
-        return {
-            "success": True,
-            "available_resolutions": {
-                name: {
-                    "width": size[0],
-                    "height": size[1],
-                    "aspect_ratio": "9:16",
-                    "description": {
-                        "shorts_hd": "YouTube Shorts HD",
-                        "shorts_fhd": "YouTube Shorts Full HD", 
-                        "tiktok": "TikTok format"
-                    }.get(name, name)
-                }
-                for name, size in resolutions.items()
-            },
-            "default": "shorts_hd"
-        }
-        
-    except ImportError:
-                 raise HTTPException(
-             status_code=503,
-             detail="Vertical cropping service not available"
-         )
+# Temporary file upload directory
+TEMP_UPLOADS_DIR = Path("temp_uploads")
+TEMP_UPLOADS_DIR.mkdir(exist_ok=True)
 
+class UploadResponse(BaseModel):
+    success: bool
+    message: str
+    file_path: Optional[str] = None
+    
 @router.post("/test-upload-vertical")
 async def test_upload_vertical(
     file: UploadFile = File(...),
-    resolution: str = "shorts_hd",
     use_speaker_detection: bool = True,
-    smoothing_strength: str = "medium"  # low, medium, high - control head movement smoothing
+    smoothing_strength: str = "very_high"
 ):
     """
-    🧪 TEST ENDPOINT: Upload an MP4 file and convert it to vertical format
-    
-    Enhanced with motion smoothing to prevent jerky head movements!
-    
-    Args:
-        file: MP4 video file to upload
-        resolution: Target resolution (shorts_hd, shorts_fhd, tiktok)
-        use_speaker_detection: Whether to use AI speaker detection
-        smoothing_strength: Motion smoothing level:
-            - "low": Minimal smoothing, more responsive (alpha=0.4, max_jump=50px)
-            - "medium": Balanced smoothing (alpha=0.2, max_jump=30px) 
-            - "high": Maximum smoothing, very stable (alpha=0.1, max_jump=20px)
-    
-    Returns:
-        Converted vertical video file for download
+    Test endpoint for uploading a video and creating a vertical crop from it.
+    This demonstrates the vertical cropping functionality on any video file.
     """
-    
-    # Validate smoothing strength
-    if smoothing_strength not in ["low", "medium", "high"]:
-        raise HTTPException(
-            status_code=400,
-            detail="Invalid smoothing_strength. Must be 'low', 'medium', or 'high'"
-        )
-    
-    # Validate file type
-    if not file.filename.lower().endswith('.mp4'):
-        raise HTTPException(
-            status_code=400, 
-            detail="Only MP4 files are supported. Please upload an .mp4 file."
-        )
-    
-    # Import filename sanitization function
-    from app.services.youtube import _sanitize_filename
-    
-    # Check if vertical cropping is available
     try:
-        from app.services.vertical_crop import crop_video_to_vertical, get_available_resolutions
-    except ImportError:
-        raise HTTPException(
-            status_code=503,
-            detail="Install required dependencies: opencv-python, pydub, webrtcvad"
-        )
-    
-    # Validate resolution
-    available_resolutions = get_available_resolutions()
-    if resolution not in available_resolutions:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Invalid resolution '{resolution}'. Available: {list(available_resolutions.keys())}"
-        )
-    
-    # Create temporary directories
-    upload_dir = Path("temp_uploads")
-    upload_dir.mkdir(exist_ok=True)
-    
-    vertical_dir = Path("temp_vertical")
-    vertical_dir.mkdir(exist_ok=True)
-    
-    temp_input_path = None
-    temp_output_path = None
-    
-    try:
-        # Sanitize the filename to prevent encoding issues
-        safe_filename = _sanitize_filename(file.filename or "upload.mp4")
+        # Create a temporary file to save the upload
+        with tempfile.NamedTemporaryFile(delete=False, suffix=Path(file.filename).suffix, dir=TEMP_UPLOADS_DIR) as tmp:
+            shutil.copyfileobj(file.file, tmp)
+            temp_path = Path(tmp.name)
         
-        print(f"\n🧪 TEST UPLOAD: Converting {file.filename} to vertical format")
-        print(f"📱 Target resolution: {resolution}")
-        print(f"🤖 Speaker detection: {use_speaker_detection}")
-        print(f"🎛️ Motion smoothing: {smoothing_strength}")
-        print(f"🔧 Safe filename: {safe_filename}")
+        print(f"📄 Uploaded file saved to temporary path: {temp_path}")
+
+        # Define the output path for the cropped video
+        output_dir = Path("temp_vertical")
+        output_dir.mkdir(exist_ok=True)
+        output_path = output_dir / f"{temp_path.stem}_vertical_{smoothing_strength}.mp4"
         
-        # Save uploaded file temporarily with sanitized name
-        temp_input_path = upload_dir / f"upload_{safe_filename}"
-        
-        with open(temp_input_path, "wb") as buffer:
-            content = await file.read()
-            buffer.write(content)
-        
-        file_size_mb = len(content) / (1024*1024)
-        print(f"📁 Uploaded file size: {file_size_mb:.1f} MB")
-        
-        # Check if file is valid
-        if not temp_input_path.exists() or temp_input_path.stat().st_size == 0:
-            raise HTTPException(status_code=400, detail="Uploaded file is empty or corrupted")
-        
-        # Generate output filename using sanitized name
-        base_name = Path(safe_filename).stem
-        output_filename = f"{base_name}_vertical_{resolution}.mp4"
-        temp_output_path = vertical_dir / output_filename
-        
-        print(f"🔄 Converting to vertical format...")
-        print(f"   Input: {temp_input_path.name}")
-        print(f"   Output: {output_filename}")
-        
-        # Convert to vertical format
+        print(f"🚀 Starting vertical crop process...")
+        print(f"   - Speaker detection: {use_speaker_detection}")
+        print(f"   - Smoothing: {smoothing_strength}")
+
+        # Call the vertical cropping service
         success = crop_video_to_vertical(
-            input_path=temp_input_path,
-            output_path=temp_output_path,
-            resolution=resolution,
+            input_path=temp_path,
+            output_path=output_path,
             use_speaker_detection=use_speaker_detection,
             smoothing_strength=smoothing_strength
         )
+
+        if not success:
+            # Clean up the temp file even on failure
+            os.remove(temp_path)
+            raise HTTPException(status_code=500, detail="Vertical cropping failed during processing")
+
+        print(f"✅ Vertical crop successful! Output at: {output_path}")
         
-        if not success or not temp_output_path.exists():
-            raise HTTPException(
-                status_code=500,
-                detail="Vertical conversion failed. Check if the uploaded file is a valid MP4 video."
-            )
-        
-        # Get output file info
-        output_size_mb = temp_output_path.stat().st_size / (1024*1024)
-        target_size = available_resolutions[resolution]
-        
-        print(f"✅ Conversion successful!")
-        print(f"📊 Output size: {output_size_mb:.1f} MB")
-        print(f"🎯 Resolution: {target_size[0]}x{target_size[1]}")
-        
-        # Return the converted file
+        # Return a downloadable link to the file
         return FileResponse(
-            path=str(temp_output_path),
-            filename=output_filename,
-            media_type="video/mp4",
-            headers={
-                "X-Original-Filename": file.filename,  # Keep original for reference
-                "X-Safe-Filename": safe_filename,      # Show sanitized version
-                "X-Conversion-Resolution": resolution,
-                "X-Target-Size": f"{target_size[0]}x{target_size[1]}",
-                "X-Speaker-Detection": str(use_speaker_detection),
-                "X-Smoothing-Strength": smoothing_strength,
-                "X-Input-Size-MB": f"{file_size_mb:.1f}",
-                "X-Output-Size-MB": f"{output_size_mb:.1f}"
-            }
+            path=output_path, 
+            media_type='video/mp4', 
+            filename=output_path.name
         )
-        
+
     except HTTPException:
+        # Re-raise HTTP exceptions to return proper status codes
         raise
     except Exception as e:
-        print(f"❌ Upload conversion failed: {str(e)}")
-        raise HTTPException(
-            status_code=500,
-            detail=f"Conversion failed: {str(e)}"
-        )
-    
-    finally:
-        # Cleanup temporary files (optional - you might want to keep them for debugging)
-        # Uncomment these lines if you want automatic cleanup:
-        
-        # if temp_input_path and temp_input_path.exists():
-        #     temp_input_path.unlink()
-        #     print(f"🧹 Cleaned up input file: {temp_input_path.name}")
-        
-        # Note: We don't delete the output file here because FileResponse needs it
-        # You might want to implement a cleanup task that runs periodically
-        pass
+        print(f"❌ An error occurred during vertical crop test: {e}")
+        # Clean up temp file on any other exception
+        if 'temp_path' in locals() and temp_path.exists():
+            os.remove(temp_path)
+        raise HTTPException(status_code=500, detail=f"An unexpected error occurred: {str(e)}")
 
 @router.post("/test-upload-info")
 async def test_upload_info(file: UploadFile = File(...)):
     """
-    🧪 TEST ENDPOINT: Get information about an uploaded MP4 file
-    
-    This endpoint analyzes the uploaded file and provides technical details
-    without converting it. Useful for debugging and validation.
+    Test endpoint to upload a video and get its info via ffprobe
     """
-    
     if not file.filename.lower().endswith('.mp4'):
         raise HTTPException(
             status_code=400,
@@ -638,30 +469,8 @@ async def test_upload_info(file: UploadFile = File(...)):
 
 @router.get("/health")
 async def health_check():
-    """Health check for workflow service"""
-    try:
-        from app.services.vertical_crop import get_available_resolutions
-        vertical_crop_available = True
-        vertical_resolutions = list(get_available_resolutions().keys())
-    except ImportError:
-        vertical_crop_available = False
-        vertical_resolutions = []
-    
-    return {
-        "status": "healthy",
-        "service": "workflow",
-        "capabilities": [
-            "video_info_extraction",
-            "transcript_extraction",
-            "gemini_analysis", 
-            "hq_video_download",  # Updated capability
-            "8k_video_support",   # New capability
-            "clip_cutting",
-            "vertical_cropping" if vertical_crop_available else "vertical_cropping_unavailable"
-        ],
-        "supported_qualities": ["best", "8k", "4k", "1440p", "1080p", "720p"],
-        "vertical_cropping": {
-            "available": vertical_crop_available,
-            "resolutions": vertical_resolutions
-        }
-    } 
+    """
+    Health check endpoint to confirm the API is running
+    """
+    print("🏥 Health check OK")
+    return {"status": "ok"} 
