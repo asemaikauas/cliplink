@@ -14,6 +14,7 @@ import wave
 import contextlib
 from pydub import AudioSegment
 from moviepy import VideoFileClip, AudioFileClip
+import subprocess
 
 # Set up logging
 logging.basicConfig(level=logging.INFO)
@@ -403,8 +404,9 @@ class VerticalCropService:
                 return False
             
             # Setup video writer for a temporary, silent video file
+            # Use a modern, high-quality codec (H.264/AVC) for the intermediate file
             temp_video_path = output_video_path.with_name(f"{output_video_path.stem}_temp.mp4")
-            fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+            fourcc = cv2.VideoWriter_fourcc(*'avc1')
             out = cv2.VideoWriter(str(temp_video_path), fourcc, fps, target_size)
             
             # Setup audio processing
@@ -452,47 +454,52 @@ class VerticalCropService:
             cap.release()
             out.release()
             
-            logger.info("🎬 Silent vertical video created. Now adding audio...")
+            logger.info("🎬 Silent vertical video created. Now adding audio via remuxing...")
 
-            # --- AUDIO INTEGRATION STEP ---
+            # --- AUDIO INTEGRATION STEP (Fast Remuxing) ---
             try:
-                # Load the original video to get its audio
-                original_clip = VideoFileClip(str(input_video_path))
-                if original_clip.audio is None:
-                    logger.warning("⚠️ Original video has no audio. The output will be silent.")
-                    # If no audio, just rename the temp file to the final output
-                    temp_video_path.rename(output_video_path)
+                # First, check if the original video has an audio track
+                with VideoFileClip(str(input_video_path)) as original_clip:
+                    if original_clip.audio is None:
+                        logger.warning("⚠️ Original video has no audio. The output will be silent.")
+                        # If no audio, just rename the temp file to the final output
+                        temp_video_path.rename(output_video_path)
+                        return True
+
+                # Use ffmpeg to copy streams without re-encoding (remuxing)
+                # This is extremely fast and preserves 100% of the quality
+                cmd = [
+                    'ffmpeg',
+                    '-hide_banner', '-loglevel', 'error',
+                    '-i', str(temp_video_path),      # Input 0: our new silent vertical video
+                    '-i', str(input_video_path),     # Input 1: the original video (for its audio)
+                    '-c:v', 'copy',                  # Copy the video stream as is
+                    '-c:a', 'copy',                  # Copy the audio stream as is
+                    '-map', '0:v:0',                 # Map video from input 0
+                    '-map', '1:a:0',                 # Map audio from input 1
+                    '-shortest',                     # Finish when the shortest stream ends
+                    str(output_video_path),
+                    '-y'                             # Overwrite output file if it exists
+                ]
+
+                result = subprocess.run(cmd, capture_output=True, text=True, check=False)
+
+                if result.returncode == 0:
+                    logger.info(f"✅ Audio successfully merged! Final video: {output_video_path}")
+                    # Clean up the temporary silent video file
+                    if temp_video_path.exists():
+                        os.remove(temp_video_path)
                     return True
-
-                # Load the new silent vertical video
-                vertical_clip = VideoFileClip(str(temp_video_path))
-
-                # Set the audio of the vertical clip to the original audio
-                vertical_clip.audio = original_clip.audio
-
-                # Write the final video with audio
-                vertical_clip.write_videofile(
-                    str(output_video_path), 
-                    codec='libx264', 
-                    audio_codec='aac',
-                    preset='slow',
-                    ffmpeg_params=['-crf', '18'],
-                    logger=None
-                )
-
-                # Close clips to free up resources
-                original_clip.close()
-                vertical_clip.close()
-
-                # Clean up the temporary silent video file
-                if temp_video_path.exists():
-                    os.remove(temp_video_path)
-                
-                logger.info(f"✅ Audio successfully merged! Final video: {output_video_path}")
-                return True
+                else:
+                    # If ffmpeg fails, log the error and fallback to the silent video
+                    logger.error(f"❌ Failed to merge audio with ffmpeg: {result.stderr.strip()}")
+                    if temp_video_path.exists():
+                        temp_video_path.rename(output_video_path)
+                        logger.warning(f"⚠️ Fallback: Saved SILENT video to {output_video_path}")
+                    return False
 
             except Exception as e:
-                logger.error(f"❌ Failed to merge audio: {e}")
+                logger.error(f"❌ An unexpected error occurred during audio merging: {e}")
                 # If audio fails, provide the silent video as a fallback
                 if temp_video_path.exists():
                     temp_video_path.rename(output_video_path)
