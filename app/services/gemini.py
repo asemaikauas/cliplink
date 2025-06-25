@@ -4,6 +4,8 @@ import httpx
 from pathlib import Path
 from typing import Dict, Any, List
 from dotenv import load_dotenv
+import asyncio
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 
 load_dotenv()
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
@@ -160,88 +162,110 @@ async def analyze_transcript_with_gemini(transcript_data: Dict[str, Any]) -> Dic
     
     print(f"\n🚀 Отправляю запрос к Gemini API...")
     
-    async with httpx.AsyncClient() as client:
-        try:
-            response = await client.post(url, headers=headers, json=data, timeout=600.0)
+    # Configure client with better connection settings
+    timeout_config = httpx.Timeout(
+        timeout=300.0,  # Reduced overall timeout
+        connect=30.0,   # Connection timeout
+        read=240.0,     # Read timeout
+        write=30.0      # Write timeout
+    )
+    
+    # Configure retry settings with exponential backoff
+    @retry(
+        stop=stop_after_attempt(3),
+        wait=wait_exponential(multiplier=1, min=4, max=10),
+        retry=retry_if_exception_type((httpx.ReadError, httpx.ConnectError, httpx.TimeoutException, httpx.NetworkError))
+    )
+    async def make_gemini_request():
+        async with httpx.AsyncClient(
+            timeout=timeout_config,
+            limits=httpx.Limits(max_keepalive_connections=5, max_connections=10)
+        ) as client:
+            response = await client.post(url, headers=headers, json=data)
             response.raise_for_status()
-            
-            gemini_response = response.json()
-            
-            if 'candidates' in gemini_response and len(gemini_response['candidates']) > 0:
-                candidate = gemini_response['candidates'][0]
-                if 'content' in candidate and 'parts' in candidate['content']:
-                    generated_text = candidate['content']['parts'][0]['text']
+            return response.json()
+
+    try:
+        gemini_response = await make_gemini_request()
+        
+        if 'candidates' in gemini_response and len(gemini_response['candidates']) > 0:
+            candidate = gemini_response['candidates'][0]
+            if 'content' in candidate and 'parts' in candidate['content']:
+                generated_text = candidate['content']['parts'][0]['text']
+                
+                print(f"✅ Получен ответ от Gemini ({len(generated_text)} символов)")
+                
+                # Clean up the response (remove markdown code blocks if present)
+                generated_text = generated_text.strip()
+                if generated_text.startswith('```json'):
+                    generated_text = generated_text[7:]
+                if generated_text.startswith('```'):
+                    generated_text = generated_text[3:]
+                if generated_text.endswith('```'):
+                    generated_text = generated_text[:-3]
+                generated_text = generated_text.strip()
+                  
+                try:
+                    viral_analysis = json.loads(generated_text)
                     
-                    print(f"✅ Получен ответ от Gemini ({len(generated_text)} символов)")
+                    print(f"\n🎯 Gemini нашел {len(viral_analysis.get('viral_segments', []))} вирусных сегментов")
                     
-                    # Clean up the response (remove markdown code blocks if present)
-                    generated_text = generated_text.strip()
-                    if generated_text.startswith('```json'):
-                        generated_text = generated_text[7:]
-                    if generated_text.startswith('```'):
-                        generated_text = generated_text[3:]
-                    if generated_text.endswith('```'):
-                        generated_text = generated_text[:-3]
-                    generated_text = generated_text.strip()
-                      
-                    try:
-                        viral_analysis = json.loads(generated_text)
+                    # Extract subtitles for each viral segment
+                    if 'viral_segments' in viral_analysis and timecodes:
+                        enhanced_segments = extract_subtitles_for_segments(
+                            viral_analysis['viral_segments'], 
+                            timecodes
+                        )
+                        viral_analysis['viral_segments'] = enhanced_segments
                         
-                        print(f"\n🎯 Gemini нашел {len(viral_analysis.get('viral_segments', []))} вирусных сегментов")
-                        
-                        # Extract subtitles for each viral segment
-                        if 'viral_segments' in viral_analysis and timecodes:
-                            enhanced_segments = extract_subtitles_for_segments(
-                                viral_analysis['viral_segments'], 
-                                timecodes
-                            )
-                            viral_analysis['viral_segments'] = enhanced_segments
-                            
-                            print(f"\n📋 ИТОГОВЫЙ JSON С СУБТИТРАМИ:")
-                            print("=" * 60)
-                            print(json.dumps(viral_analysis, ensure_ascii=False, indent=2))
-                            print("=" * 60)
-                        else:
-                            print(f"⚠️ Не найдены вирусные сегменты или таймкоды для обработки")
-                        
-                        # Combine original data with Gemini analysis
-                        result = {
-                            "gemini_analysis": viral_analysis
+                        print(f"\n📋 ИТОГОВЫЙ JSON С СУБТИТРАМИ:")
+                        print("=" * 60)
+                        print(json.dumps(viral_analysis, ensure_ascii=False, indent=2))
+                        print("=" * 60)
+                    else:
+                        print(f"⚠️ Не найдены вирусные сегменты или таймкоды для обработки")
+                    
+                    # Combine original data with Gemini analysis
+                    result = {
+                        "gemini_analysis": viral_analysis
+                    }
+                    
+                    return result
+                    
+                except json.JSONDecodeError as e:
+                    print(f"❌ JSON decode error: {e}")
+                    print(f"❌ Generated text: {generated_text}")
+                    return {
+                        "gemini_analysis": {
+                            "error": "Failed to parse Gemini response",
+                            "raw_response": generated_text
                         }
-                        
-                        return result
-                        
-                    except json.JSONDecodeError as e:
-                        print(f"❌ JSON decode error: {e}")
-                        print(f"❌ Generated text: {generated_text}")
-                        return {
-                            "gemini_analysis": {
-                                "error": "Failed to parse Gemini response",
-                                "raw_response": generated_text
-                            }
-                        }
-            
-            print(f"❌ Нет валидного ответа от Gemini")
-            return {
-                "gemini_analysis": {
-                    "error": "No valid response from Gemini",
-                    "raw_response": gemini_response
-                }
+                    }
+        
+        print(f"❌ Нет валидного ответа от Gemini")
+        return {
+            "gemini_analysis": {
+                "error": "No valid response from Gemini",
+                "raw_response": gemini_response
             }
-            
-        except httpx.HTTPStatusError as e:
-            error_detail = ""
-            try:
-                error_response = e.response.json()
-                error_detail = json.dumps(error_response, indent=2)
-            except:
-                error_detail = e.response.text
-            
-            print(f"❌ Gemini API error {e.response.status_code}: {error_detail}")
-            raise Exception(f"Gemini API error {e.response.status_code}: {error_detail}")
-        except httpx.TimeoutException:
-            print(f"⏱️ Gemini API request timed out after 600 seconds")
-            raise Exception("Gemini API request timed out after 600 seconds")
-        except Exception as e:
-            print(f"❌ Unexpected error calling Gemini API: {str(e)}")
-            raise Exception(f"Unexpected error calling Gemini API: {str(e)}") 
+        }
+        
+    except httpx.HTTPStatusError as e:
+        error_detail = ""
+        try:
+            error_response = e.response.json()
+            error_detail = json.dumps(error_response, indent=2)
+        except:
+            error_detail = e.response.text
+        
+        print(f"❌ Gemini API error {e.response.status_code}: {error_detail}")
+        raise Exception(f"Gemini API error {e.response.status_code}: {error_detail}")
+    except httpx.TimeoutException:
+        print(f"⏱️ Gemini API request timed out after multiple retries")
+        raise Exception("Gemini API request timed out after multiple retries")
+    except (httpx.ReadError, httpx.ConnectError, httpx.NetworkError) as e:
+        print(f"❌ Network error calling Gemini API: {str(e)}")
+        raise Exception(f"Network error calling Gemini API: {str(e)}")
+    except Exception as e:
+        print(f"❌ Unexpected error calling Gemini API: {str(e)}")
+        raise Exception(f"Unexpected error calling Gemini API: {str(e)}") 

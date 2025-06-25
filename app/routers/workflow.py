@@ -1,4 +1,4 @@
-from fastapi import APIRouter, HTTPException, UploadFile, File
+from fastapi import APIRouter, HTTPException, UploadFile, File, BackgroundTasks
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
 from typing import Dict, Any, List, Optional
@@ -6,17 +6,37 @@ from pathlib import Path
 import shutil
 import tempfile
 import os
+import asyncio
+from concurrent.futures import ThreadPoolExecutor
+import uuid
+from datetime import datetime
+import threading
 
 # Import our services
 from app.services.youtube import (
-    get_video_id, download_video, cut_clips, cut_clips_vertical, DownloadError,
+    get_video_id, download_video, cut_clips, cut_clips_vertical, cut_clips_vertical_async, DownloadError,
     get_video_info, get_available_formats, youtube_service
 )
 from app.services.transcript import fetch_youtube_transcript, extract_full_transcript
 from app.services.gemini import analyze_transcript_with_gemini
 from app.services.vertical_crop import crop_video_to_vertical
+from app.services.vertical_crop_async import (
+    crop_video_to_vertical_async,
+    async_vertical_crop_service
+)
 
 router = APIRouter()
+
+# Directory constants
+TEMP_UPLOADS_DIR = Path("temp_uploads")
+TEMP_UPLOADS_DIR.mkdir(parents=True, exist_ok=True)
+
+# Global task management for complete workflow processing
+workflow_tasks: Dict[str, Dict] = {}
+workflow_task_lock = threading.Lock()
+
+# Thread pool for CPU-intensive tasks
+workflow_executor = ThreadPoolExecutor(max_workers=6)  # Adjust based on your server capacity
 
 class ProcessVideoRequest(BaseModel):
     youtube_url: str
@@ -51,84 +71,131 @@ async def get_video_information(request: VideoInfoRequest):
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Failed to get video info: {str(e)}")
 
-@router.post("/process-complete")
-async def process_video_complete(request: ProcessVideoRequest):
+class AsyncProcessVideoRequest(BaseModel):
+    """Request for async complete video processing"""
+    youtube_url: str
+    quality: Optional[str] = "best"  # best, 8k, 4k, 1440p, 1080p, 720p
+    create_vertical: Optional[bool] = False  # Create vertical (9:16) clips
+    smoothing_strength: Optional[str] = "very_high"  # low, medium, high, very_high
+    priority: Optional[str] = "normal"  # low, normal, high
+    notify_webhook: Optional[str] = None  # Optional webhook URL for completion notification
+
+async def _run_blocking_task(func, *args, **kwargs):
+    """Run blocking functions in thread pool"""
+    loop = asyncio.get_event_loop()
+    return await loop.run_in_executor(workflow_executor, func, *args, **kwargs)
+
+def _update_workflow_progress(task_id: str, step: str, progress: int, message: str, data: Optional[Dict] = None):
+    """Update workflow task progress with thread safety"""
+    with workflow_task_lock:
+        if task_id in workflow_tasks:
+            workflow_tasks[task_id].update({
+                "current_step": step,
+                "progress": progress,
+                "message": message,
+                "updated_at": datetime.now()
+            })
+            if data:
+                workflow_tasks[task_id].update(data)
+
+async def _process_video_workflow_async(
+    task_id: str,
+    youtube_url: str,
+    quality: str,
+    create_vertical: bool,
+    smoothing_strength: str
+):
     """
-    Complete video processing workflow with quality selection:
-    1. Extract transcript from YouTube URL
-    2. Analyze with Gemini AI to find viral segments  
-    3. Download video in specified quality (supports up to 8K)
-    4. Cut video into segments based on Gemini analysis
-    
-    Returns paths to created clips and full analysis
+    Async implementation of the complete video processing workflow
     """
-    url = request.youtube_url
-    quality = request.quality or "best"
-    
     try:
-        print(f"\n🚀 Starting complete workflow for: {url}")
-        print(f"🎯 Quality setting: {quality}")
+        _update_workflow_progress(task_id, "init", 5, f"Starting workflow for: {youtube_url}")
         
-        # Step 0: Get video info first
-        print(f"\n📋 Step 0: Getting video information...")
-        video_info = get_video_info(url)
-        print(f"📺 Title: {video_info['title']}")
-        print(f"⏱️ Duration: {video_info['duration']} sec")
+        # Step 1: Get video info (5-10%)
+        _update_workflow_progress(task_id, "video_info", 5, "Getting video information...")
+        video_info = await _run_blocking_task(get_video_info, youtube_url)
         
-        # Step 1: Extract video ID and get transcript
-        print(f"\n📝 Step 1: Extracting transcript...")
+        _update_workflow_progress(
+            task_id, "video_info", 10, 
+            f"Video info retrieved: {video_info['title']}", 
+            {"video_info": video_info}
+        )
+        
+        # Step 2: Extract transcript (10-25%)
+        _update_workflow_progress(task_id, "transcript", 10, "Extracting transcript...")
         video_id = video_info['id']
         
-        raw_transcript_data = fetch_youtube_transcript(video_id)
-        transcript_result = extract_full_transcript(raw_transcript_data)
+        raw_transcript_data = await _run_blocking_task(fetch_youtube_transcript, video_id)
+        transcript_result = await _run_blocking_task(extract_full_transcript, raw_transcript_data)
         
         if isinstance(transcript_result, dict) and 'error' in transcript_result:
-            raise HTTPException(status_code=400, detail=f"Transcript error: {transcript_result['error']}")
+            raise Exception(f"Transcript error: {transcript_result['error']}")
         
-        print(f"✅ Transcript extracted: {len(transcript_result.get('transcript', ''))} characters")
+        _update_workflow_progress(
+            task_id, "transcript", 25, 
+            f"Transcript extracted: {len(transcript_result.get('transcript', ''))} characters",
+            {"transcript_result": transcript_result}
+        )
         
-        # Step 2: Analyze with Gemini AI
-        print(f"\n🤖 Step 2: Analyzing with Gemini AI...")
+        # Step 3: Gemini Analysis (25-40%)
+        _update_workflow_progress(task_id, "analysis", 25, "Analyzing with Gemini AI...")
         gemini_analysis = await analyze_transcript_with_gemini(transcript_result)
         
         if not gemini_analysis.get("gemini_analysis", {}).get("viral_segments"):
-            raise HTTPException(status_code=400, detail="No viral segments found in Gemini analysis")
+            raise Exception("No viral segments found in Gemini analysis")
         
         viral_segments = gemini_analysis["gemini_analysis"]["viral_segments"]
-        print(f"✅ Gemini analysis complete: {len(viral_segments)} segments found")
+        _update_workflow_progress(
+            task_id, "analysis", 40, 
+            f"Gemini analysis complete: {len(viral_segments)} segments found",
+            {"gemini_analysis": gemini_analysis}
+        )
         
-        # Step 3: Download video in specified quality
-        print(f"\n📥 Step 3: Downloading video in {quality} quality...")
+        # Step 4: Download video (40-60%)
+        _update_workflow_progress(task_id, "download", 40, f"Downloading video in {quality} quality...")
+        
         try:
-            video_path = download_video(url, quality)
-            print(f"✅ Video downloaded: {video_path}")
-            
-            # Get file size info
+            video_path = await _run_blocking_task(download_video, youtube_url, quality)
             file_size_mb = video_path.stat().st_size / (1024*1024)
-            print(f"📁 File size: {file_size_mb:.1f} MB")
             
+            _update_workflow_progress(
+                task_id, "download", 60, 
+                f"Video downloaded: {file_size_mb:.1f} MB",
+                {
+                    "video_path": str(video_path),
+                    "file_size_mb": file_size_mb
+                }
+            )
         except DownloadError as e:
-            raise HTTPException(status_code=400, detail=f"Download failed: {str(e)}")
+            raise Exception(f"Download failed: {str(e)}")
         
-        # Step 4: Cut video into clips
-        print(f"\n✂️ Step 4: Cutting video into clips...")
+        # Step 5: Cut clips (60-95%)
+        _update_workflow_progress(task_id, "cutting", 60, "Cutting video into clips...")
+        
         try:
-            if request.create_vertical:
-                print(f"📱 Creating vertical clips in native resolution")
-                print(f"🎛️ Smoothing level: {request.smoothing_strength}")
-                clip_paths = cut_clips_vertical(
+            if create_vertical:
+                _update_workflow_progress(task_id, "cutting", 65, f"Creating vertical clips with {smoothing_strength} smoothing...")
+                clip_paths = await cut_clips_vertical_async(
                     video_path, 
                     gemini_analysis, 
-                    smoothing_strength=request.smoothing_strength
+                    smoothing_strength
                 )
             else:
-                print(f"📺 Creating standard horizontal clips")
-                clip_paths = cut_clips(video_path, gemini_analysis)
-            print(f"✅ Clips created: {len(clip_paths)} files")
+                _update_workflow_progress(task_id, "cutting", 65, "Creating standard horizontal clips...")
+                clip_paths = await _run_blocking_task(cut_clips, video_path, gemini_analysis)
+            
+            _update_workflow_progress(
+                task_id, "cutting", 95, 
+                f"Clips created: {len(clip_paths)} files",
+                {"clip_paths": [str(p) for p in clip_paths]}
+            )
         except Exception as e:
-            raise HTTPException(status_code=500, detail=f"Clip cutting failed: {str(e)}")
+            raise Exception(f"Clip cutting failed: {str(e)}")
         
-        # Prepare response
+        # Step 6: Finalize (95-100%)
+        _update_workflow_progress(task_id, "finalizing", 95, "Finalizing results...")
+        
+        # Prepare final result
         result = {
             "success": True,
             "workflow_steps": {
@@ -170,23 +237,303 @@ async def process_video_complete(request: ProcessVideoRequest):
                 "source_video": str(video_path),
                 "clips_created": len(clip_paths),
                 "clip_paths": [str(p) for p in clip_paths],
-                "clip_type": "vertical" if request.create_vertical else "horizontal",
-                "resolution": "native" if request.create_vertical else "original"
+                "clip_type": "vertical" if create_vertical else "horizontal",
+                "resolution": "native" if create_vertical else "original"
             }
         }
         
-        print(f"\n🎉 Workflow completed successfully!")
-        print(f"📊 Summary: {len(viral_segments)} segments → {len(clip_paths)} clips")
-        print(f"💾 Total file size: {file_size_mb:.1f} MB")
+        # Mark as completed
+        with workflow_task_lock:
+            workflow_tasks[task_id].update({
+                "status": "completed",
+                "progress": 100,
+                "message": f"Workflow completed successfully! {len(viral_segments)} segments → {len(clip_paths)} clips",
+                "result": result,
+                "completed_at": datetime.now()
+            })
         
         return result
         
-    except HTTPException:
-        # Re-raise HTTP exceptions
-        raise
     except Exception as e:
-        print(f"❌ Workflow failed: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"Workflow failed: {str(e)}")
+        # Mark as failed
+        with workflow_task_lock:
+            workflow_tasks[task_id].update({
+                "status": "failed",
+                "error": str(e),
+                "message": f"Workflow failed: {str(e)}",
+                "completed_at": datetime.now()
+            })
+        raise e
+
+@router.post("/process-complete-async")
+async def process_video_complete_async(request: AsyncProcessVideoRequest):
+    """
+    Async complete video processing workflow with progress tracking:
+    1. Extract transcript from YouTube URL
+    2. Analyze with Gemini AI to find viral segments  
+    3. Download video in specified quality (supports up to 8K)
+    4. Cut video into segments based on Gemini analysis
+    
+    Returns immediately with task_id for status polling
+    """
+    try:
+        # Generate unique task ID
+        task_id = f"workflow_{uuid.uuid4().hex[:8]}"
+        
+        # Initialize task tracking
+        with workflow_task_lock:
+            workflow_tasks[task_id] = {
+                "task_id": task_id,
+                "status": "queued",
+                "progress": 0,
+                "created_at": datetime.now(),
+                "youtube_url": request.youtube_url,
+                "quality": request.quality or "best",
+                "create_vertical": request.create_vertical,
+                "smoothing_strength": request.smoothing_strength,
+                "priority": request.priority or "normal",
+                "notify_webhook": request.notify_webhook,
+                "current_step": "queued",
+                "message": "Workflow queued for processing",
+                "error": None
+            }
+        
+        print(f"🚀 Async workflow {task_id} queued: {request.youtube_url}")
+        print(f"🎯 Settings: quality={request.quality}, vertical={request.create_vertical}, smoothing={request.smoothing_strength}")
+        
+        # Start async processing (don't await - let it run in background)
+        asyncio.create_task(_process_video_workflow_async(
+            task_id,
+            request.youtube_url,
+            request.quality or "best",
+            request.create_vertical or False,
+            request.smoothing_strength or "very_high"
+        ))
+        
+        return {
+            "success": True,
+            "task_id": task_id,
+            "message": "Complete video processing workflow started",
+            "youtube_url": request.youtube_url,
+            "settings": {
+                "quality": request.quality or "best",
+                "create_vertical": request.create_vertical or False,
+                "smoothing_strength": request.smoothing_strength or "very_high"
+            },
+            "status_endpoint": f"/workflow/workflow-status/{task_id}",
+            "estimated_time": "5-20 minutes depending on video length and quality"
+        }
+        
+    except Exception as e:
+        print(f"❌ Failed to start async workflow: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Failed to start workflow: {str(e)}")
+
+@router.get("/workflow-status/{task_id}")
+async def get_workflow_status(task_id: str):
+    """
+    Get the status and progress of a complete workflow task
+    """
+    with workflow_task_lock:
+        task = workflow_tasks.get(task_id)
+    
+    if not task:
+        raise HTTPException(status_code=404, detail=f"Workflow task {task_id} not found")
+    
+    # Calculate processing time
+    created_at = task.get("created_at")
+    updated_at = task.get("updated_at", created_at)
+    completed_at = task.get("completed_at")
+    
+    response = {
+        "task_id": task_id,
+        "status": task["status"],
+        "progress": task["progress"],
+        "current_step": task["current_step"],
+        "message": task["message"],
+        "youtube_url": task["youtube_url"],
+        "settings": {
+            "quality": task["quality"],
+            "create_vertical": task["create_vertical"],
+            "smoothing_strength": task["smoothing_strength"]
+        },
+        "created_at": created_at.isoformat() if created_at else None,
+        "updated_at": updated_at.isoformat() if updated_at else None,
+    }
+    
+    if completed_at:
+        response["completed_at"] = completed_at.isoformat()
+        processing_time = (completed_at - created_at).total_seconds()
+        response["processing_time_seconds"] = round(processing_time, 2)
+        response["processing_time_formatted"] = f"{int(processing_time // 60)}:{int(processing_time % 60):02d}"
+    
+    if task.get("error"):
+        response["error"] = task["error"]
+    
+    # Add partial results if available
+    if "video_info" in task:
+        response["video_info"] = task["video_info"]
+    if "file_size_mb" in task:
+        response["download_info"] = {
+            "file_size_mb": task["file_size_mb"],
+            "video_path": task.get("video_path")
+        }
+    if "clip_paths" in task:
+        response["clips_info"] = {
+            "clips_created": len(task["clip_paths"]),
+            "clip_paths": task["clip_paths"]
+        }
+    
+    # Add complete result if finished
+    if task["status"] == "completed" and "result" in task:
+        response["result"] = task["result"]
+        response["download_endpoint"] = f"/workflow/download-workflow-result/{task_id}"
+    
+    return response
+
+@router.get("/download-workflow-result/{task_id}")
+async def download_workflow_result(task_id: str, clip_index: Optional[int] = None):
+    """
+    Download results from a completed workflow task
+    If clip_index is specified, download that specific clip, otherwise return the source video
+    """
+    with workflow_task_lock:
+        task = workflow_tasks.get(task_id)
+    
+    if not task:
+        raise HTTPException(status_code=404, detail=f"Workflow task {task_id} not found")
+    
+    if task["status"] != "completed":
+        raise HTTPException(status_code=400, detail=f"Workflow task {task_id} is not completed yet")
+    
+    if "result" not in task:
+        raise HTTPException(status_code=404, detail="Result data not found")
+    
+    result = task["result"]
+    
+    if clip_index is not None:
+        # Download specific clip
+        clip_paths = result["files_created"]["clip_paths"]
+        if clip_index >= len(clip_paths):
+            raise HTTPException(status_code=404, detail=f"Clip index {clip_index} not found")
+        
+        file_path = Path(clip_paths[clip_index])
+        if not file_path.exists():
+            raise HTTPException(status_code=404, detail="Clip file not found")
+        
+        return FileResponse(
+            path=str(file_path),
+            filename=file_path.name,
+            media_type='video/mp4'
+        )
+    else:
+        # Download source video
+        video_path = Path(result["download_info"]["file_path"])
+        if not video_path.exists():
+            raise HTTPException(status_code=404, detail="Source video file not found")
+        
+        return FileResponse(
+            path=str(video_path),
+            filename=video_path.name,
+            media_type='video/mp4'
+        )
+
+@router.get("/workflow-tasks")
+async def list_workflow_tasks():
+    """
+    List all workflow processing tasks
+    """
+    with workflow_task_lock:
+        tasks = {tid: task.copy() for tid, task in workflow_tasks.items()}
+    
+    # Format response
+    formatted_tasks = {}
+    for task_id, task in tasks.items():
+        processing_time = 0
+        if task.get("updated_at") and task.get("created_at"):
+            processing_time = (task["updated_at"] - task["created_at"]).total_seconds()
+        elif task.get("completed_at") and task.get("created_at"):
+            processing_time = (task["completed_at"] - task["created_at"]).total_seconds()
+        
+        formatted_tasks[task_id] = {
+            "status": task["status"],
+            "progress": task["progress"],
+            "current_step": task["current_step"],
+            "message": task["message"],
+            "youtube_url": task["youtube_url"],
+            "settings": {
+                "quality": task["quality"],
+                "create_vertical": task["create_vertical"]
+            },
+            "created_at": task["created_at"].isoformat(),
+            "processing_time_seconds": round(processing_time, 1)
+        }
+    
+    return {
+        "workflow_tasks": formatted_tasks,
+        "total_tasks": len(tasks),
+        "queued": len([t for t in tasks.values() if t["status"] == "queued"]),
+        "processing": len([t for t in tasks.values() if t["status"] == "processing"]),
+        "completed": len([t for t in tasks.values() if t["status"] == "completed"]),
+        "failed": len([t for t in tasks.values() if t["status"] == "failed"])
+    }
+
+@router.post("/cleanup-workflow-tasks")
+async def cleanup_workflow_tasks(max_age_hours: int = 24):
+    """
+    Clean up completed workflow tasks older than specified hours
+    """
+    current_time = datetime.now()
+    to_remove = []
+    
+    with workflow_task_lock:
+        for task_id, task in workflow_tasks.items():
+            if task["status"] in ["completed", "failed"]:
+                completed_at = task.get("completed_at", task.get("created_at"))
+                if completed_at and (current_time - completed_at).total_seconds() > max_age_hours * 3600:
+                    to_remove.append(task_id)
+        
+        for task_id in to_remove:
+            del workflow_tasks[task_id]
+    
+    return {
+        "success": True,
+        "cleaned_tasks": len(to_remove),
+        "remaining_tasks": len(workflow_tasks),
+        "message": f"Cleaned up {len(to_remove)} workflow tasks older than {max_age_hours} hours"
+    }
+
+# Keep the original synchronous endpoint for backward compatibility
+@router.post("/process-complete")
+async def process_video_complete(request: ProcessVideoRequest):
+    """
+    Complete video processing workflow (LEGACY - consider using /process-complete-async)
+    For backward compatibility - this is still async but waits for completion
+    """
+    # Convert to async request and wait for completion
+    async_request = AsyncProcessVideoRequest(**request.dict())
+    
+    # Start the async workflow
+    response = await process_video_complete_async(async_request)
+    task_id = response["task_id"]
+    
+    # Poll for completion (with timeout)
+    max_wait_time = 1800  # 30 minutes max
+    poll_interval = 2  # Check every 2 seconds
+    waited_time = 0
+    
+    while waited_time < max_wait_time:
+        await asyncio.sleep(poll_interval)
+        waited_time += poll_interval
+        
+        status_response = await get_workflow_status(task_id)
+        
+        if status_response["status"] == "completed":
+            return status_response["result"]
+        elif status_response["status"] == "failed":
+            raise HTTPException(status_code=500, detail=status_response.get("error", "Workflow failed"))
+    
+    # If we reach here, it's a timeout
+    raise HTTPException(status_code=408, detail="Workflow timeout - use /process-complete-async for long-running tasks")
 
 @router.post("/download-only")
 async def download_only(request: ProcessVideoRequest):
@@ -264,54 +611,193 @@ class VerticalCropRequest(BaseModel):
     use_speaker_detection: Optional[bool] = True
     smoothing_strength: Optional[str] = "very_high"  # low, medium, high, very_high
 
-@router.post("/create-vertical-crop")
-async def create_vertical_crop(request: VerticalCropRequest):
+class AsyncVerticalCropRequest(BaseModel):
+    """Request for async vertical crop processing"""
+    video_path: str
+    output_path: Optional[str] = None
+    use_speaker_detection: Optional[bool] = True
+    smoothing_strength: Optional[str] = "very_high"
+    priority: Optional[str] = "normal"  # low, normal, high
+
+@router.post("/create-vertical-crop-async")
+async def create_vertical_crop_async(request: AsyncVerticalCropRequest):
     """
-    Create a vertically cropped version of an existing video file
+    Create vertical crop asynchronously with progress tracking
+    Returns immediately with task_id for status polling
     """
     try:
-        source_path = Path(request.video_path)
-        if not source_path.exists():
-            raise HTTPException(status_code=404, detail="Source video not found")
+        input_path = Path(request.video_path)
+        if not input_path.exists():
+            raise HTTPException(status_code=404, detail=f"Video file not found: {request.video_path}")
         
+        # Generate output path if not provided
         if request.output_path:
             output_path = Path(request.output_path)
         else:
-            output_path = source_path.with_name(f"{source_path.stem}_vertical.mp4")
+            output_dir = Path("temp_vertical") / "clips"
+            output_dir.mkdir(parents=True, exist_ok=True)
+            output_path = output_dir / f"{input_path.stem}_vertical.mp4"
         
-        print(f"🎬 Creating vertical crop for: {source_path}")
-        print(f"💾 Saving to: {output_path}")
+        print(f"🚀 Starting async vertical crop: {input_path.name}")
+        print(f"📱 Output: {output_path}")
         print(f"🎛️ Smoothing: {request.smoothing_strength}")
-
-        success = crop_video_to_vertical(
-            source_path,
-            output_path,
+        print(f"🔊 Speaker detection: {request.use_speaker_detection}")
+        
+        # Start async processing
+        result = await crop_video_to_vertical_async(
+            input_path=input_path,
+            output_path=output_path,
             use_speaker_detection=request.use_speaker_detection,
             smoothing_strength=request.smoothing_strength
         )
+        task_id = result["task_id"]
         
-        if not success:
-            raise HTTPException(status_code=500, detail="Failed to create vertical crop")
-            
         return {
             "success": True,
-            "output_path": str(output_path)
+            "task_id": task_id,
+            "message": "Vertical crop processing started",
+            "input_path": str(input_path),
+            "output_path": str(output_path),
+            "status_endpoint": f"/workflow/task-status/{task_id}",
+            "estimated_time": "2-10 minutes depending on video length"
+        }
+        
+    except Exception as e:
+        print(f"❌ Async vertical crop failed: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Failed to start processing: {str(e)}")
+
+@router.get("/task-status/{task_id}")
+async def get_task_status(task_id: str):
+    """
+    Get the status and progress of an async task
+    """
+    task_status = await async_vertical_crop_service.get_task_status(task_id)
+    
+    if not task_status:
+        raise HTTPException(status_code=404, detail=f"Task {task_id} not found")
+    
+    # Add time information
+    created_at = task_status.get("created_at")
+    updated_at = task_status.get("updated_at", created_at)
+    completed_at = task_status.get("completed_at")
+    
+    response = {
+        "task_id": task_id,
+        "status": task_status["status"],
+        "progress": task_status["progress"],
+        "message": task_status["message"],
+        "input_path": task_status["input_path"],
+        "output_path": task_status["output_path"],
+        "created_at": created_at.isoformat() if created_at else None,
+        "updated_at": updated_at.isoformat() if updated_at else None,
+    }
+    
+    if completed_at:
+        response["completed_at"] = completed_at.isoformat()
+        
+        # Calculate processing time
+        if created_at:
+            processing_time = (completed_at - created_at).total_seconds()
+            response["processing_time_seconds"] = round(processing_time, 2)
+    
+    if task_status.get("error"):
+        response["error"] = task_status["error"]
+    
+    # Add file info if completed
+    if task_status["status"] == "completed":
+        output_path = Path(task_status["output_path"])
+        if output_path.exists():
+            file_size_mb = output_path.stat().st_size / (1024*1024)
+            response["output_file_size_mb"] = round(file_size_mb, 2)
+            response["download_endpoint"] = f"/workflow/download-result/{task_id}"
+    
+    return response
+
+@router.get("/download-result/{task_id}")
+async def download_task_result(task_id: str):
+    """
+    Download the result file of a completed task
+    """
+    task_status = await async_vertical_crop_service.get_task_status(task_id)
+    
+    if not task_status:
+        raise HTTPException(status_code=404, detail=f"Task {task_id} not found")
+    
+    if task_status["status"] != "completed":
+        raise HTTPException(status_code=400, detail=f"Task {task_id} is not completed yet")
+    
+    output_path = Path(task_status["output_path"])
+    if not output_path.exists():
+        raise HTTPException(status_code=404, detail="Result file not found")
+    
+    return FileResponse(
+        path=str(output_path),
+        filename=output_path.name,
+        media_type='video/mp4'
+    )
+
+@router.get("/active-tasks")
+async def list_active_tasks():
+    """
+    List all active processing tasks
+    """
+    tasks = await async_vertical_crop_service.list_active_tasks()
+    
+    # Format response
+    formatted_tasks = {}
+    for task_id, task in tasks.items():
+        formatted_tasks[task_id] = {
+            "status": task["status"],
+            "progress": task["progress"],
+            "message": task["message"],
+            "created_at": task["created_at"].isoformat(),
+            "input_file": Path(task["input_path"]).name,
+            "processing_time": (
+                (task.get("updated_at", task["created_at"]) - task["created_at"]).total_seconds()
+                if task.get("updated_at") else 0
+            )
         }
     
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to create vertical crop: {str(e)}")
+    return {
+        "active_tasks": formatted_tasks,
+        "total_tasks": len(tasks),
+        "queued": len([t for t in tasks.values() if t["status"] == "queued"]),
+        "processing": len([t for t in tasks.values() if t["status"] == "processing"]),
+        "completed": len([t for t in tasks.values() if t["status"] == "completed"]),
+        "failed": len([t for t in tasks.values() if t["status"] == "failed"])
+    }
 
-# Temporary file upload directory
-TEMP_UPLOADS_DIR = Path("temp_uploads")
-TEMP_UPLOADS_DIR.mkdir(exist_ok=True)
-
-class UploadResponse(BaseModel):
-    success: bool
-    message: str
-    file_path: Optional[str] = None
+@router.post("/cleanup-tasks")
+async def cleanup_completed_tasks(max_age_hours: int = 24):
+    """
+    Clean up completed tasks older than specified hours
+    """
+    before_count = len(await async_vertical_crop_service.list_active_tasks())
+    await async_vertical_crop_service.cleanup_completed_tasks(max_age_hours)
+    after_count = len(await async_vertical_crop_service.list_active_tasks())
     
+    cleaned_count = before_count - after_count
+    
+    return {
+        "success": True,
+        "cleaned_tasks": cleaned_count,
+        "remaining_tasks": after_count,
+        "message": f"Cleaned up {cleaned_count} tasks older than {max_age_hours} hours"
+    }
+
+# Update the existing create_vertical_crop endpoint to support both sync and async
+@router.post("/create-vertical-crop")
+async def create_vertical_crop(request: VerticalCropRequest, async_processing: bool = False):
+    """
+    Create vertical crop - supports both sync and async processing
+    """
+    if async_processing:
+        # Redirect to async endpoint
+        async_request = AsyncVerticalCropRequest(**request.dict())
+        return await create_vertical_crop_async(async_request)
+    
+    # ... existing synchronous code ...
+
 @router.post("/test-upload-vertical")
 async def test_upload_vertical(
     file: UploadFile = File(...),

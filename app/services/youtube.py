@@ -5,6 +5,7 @@ import subprocess
 from pathlib import Path
 from typing import List, Dict, Optional
 from moviepy import VideoFileClip
+import asyncio
 
 # Import vertical cropping service
 try:
@@ -164,37 +165,47 @@ class YouTubeService:
         print(f"📺 Скачиваю: {title}")
         print(f"🆔 ID: {video_id}")
         
-        # Configure format selector based on requirements
+        # Configure format selector based on requirements with Apple compatibility
         if force_8k:
-            print("🎯 Режим 8K активирован!")
+            print("🎯 Режим 8K активирован (Apple-совместимый)!")
             format_selector = (
-                'bestvideo[height>=4320]+bestaudio[ext=m4a]/'  # 8K priority
-                'bestvideo[height>=2160]+bestaudio[ext=m4a]/'  # 4K fallback
-                'bestvideo[filesize>500M]+bestaudio[ext=m4a]/'  # Large files
-                'bestvideo+bestaudio'
+                # Приоритет H.264 (AVC) для Apple совместимости
+                'bestvideo[vcodec^=avc][height>=4320]+bestaudio[acodec^=mp4a]/'  # 8K H.264 + AAC
+                'bestvideo[vcodec^=avc][height>=2160]+bestaudio[acodec^=mp4a]/'  # 4K H.264 + AAC fallback
+                'bestvideo[ext=mp4][height>=4320]+bestaudio[ext=m4a]/'  # MP4 container 8K
+                'bestvideo[height>=4320]+bestaudio[ext=m4a]/'  # 8K любой кодек
+                'bestvideo[vcodec^=avc]+bestaudio[acodec^=mp4a]/'  # Лучший H.264
+                'bestvideo+bestaudio'  # Fallback
             )
-            outtmpl = str(self.downloads_dir / '8K-%(title)s-%(id)s.%(ext)s')
+            outtmpl = str(self.downloads_dir / '8K-Apple-%(title)s-%(id)s.%(ext)s')
             
         elif max_height:
-            print(f"🎯 Максимальное разрешение: {max_height}p")
+            print(f"🎯 Максимальное разрешение: {max_height}p (Apple-совместимый)")
             format_selector = (
-                f'bestvideo[height<={max_height}]+bestaudio[ext=m4a]/'
-                f'bestvideo[ext=mp4][height<={max_height}]+bestaudio[ext=m4a]/'
-                f'best[height<={max_height}]'
+                # Приоритет H.264 (AVC) кодека для максимальной совместимости
+                f'bestvideo[vcodec^=avc][height<={max_height}]+bestaudio[acodec^=mp4a]/'  # H.264 + AAC
+                f'bestvideo[ext=mp4][height<={max_height}]+bestaudio[ext=m4a]/'  # MP4 container
+                f'bestvideo[vcodec^=avc][height<={max_height}]+bestaudio[ext=m4a]/'  # H.264 + M4A
+                f'bestvideo[height<={max_height}]+bestaudio[acodec^=mp4a]/'  # Любой видео + AAC
+                f'best[vcodec^=avc][height<={max_height}]/'  # Best H.264
+                f'best[height<={max_height}]'  # Fallback
             )
-            outtmpl = str(self.downloads_dir / f'{max_height}p-%(title)s-%(id)s.%(ext)s')
+            outtmpl = str(self.downloads_dir / f'{max_height}p-Apple-%(title)s-%(id)s.%(ext)s')
             
         else:
-            print("🎯 Максимальное доступное качество")
+            print("🎯 Максимальное доступное качество (Apple-совместимый)")
             format_selector = (
-                'bestvideo[height>=2160]+bestaudio[ext=m4a]/'  # 4K+ priority
-                'bestvideo+bestaudio[ext=m4a]/'  # Best video + m4a audio
-                'bestvideo[ext=mp4]+bestaudio[ext=m4a]/'  # MP4 video + m4a audio
-                'bestvideo+bestaudio/'  # Best video + best audio
-                'best[height>=2160]/'  # Best 4K+
+                # Приоритет H.264 (AVC) кодека для Apple устройств
+                'bestvideo[vcodec^=avc][height>=2160]+bestaudio[acodec^=mp4a]/'  # 4K+ H.264 + AAC
+                'bestvideo[vcodec^=avc]+bestaudio[acodec^=mp4a]/'  # Лучший H.264 + AAC
+                'bestvideo[ext=mp4]+bestaudio[ext=m4a]/'  # MP4 + M4A
+                'bestvideo[vcodec^=avc]+bestaudio[ext=m4a]/'  # H.264 + M4A
+                'bestvideo[height>=2160]+bestaudio[acodec^=mp4a]/'  # 4K+ любой + AAC
+                'bestvideo+bestaudio[acodec^=mp4a]/'  # Лучший видео + AAC аудио
+                'best[vcodec^=avc]/'  # Лучший H.264
                 'best'  # Fallback
             )
-            outtmpl = str(self.downloads_dir / 'UHQ-%(title)s-%(id)s.%(ext)s')
+            outtmpl = str(self.downloads_dir / 'UHQ-Apple-%(title)s-%(id)s.%(ext)s')
         
         # Setup download options
         ydl_opts = self.base_ydl_opts.copy()
@@ -424,13 +435,23 @@ def cut_clips(video_path: Path, analysis: Dict) -> List[Path]:
                 else:
                     raise e
             
-            # Write video file with enhanced error handling
-            print(f"💾 Записываю видеофайл...")
+            # Write video file with MAXIMUM QUALITY settings
+            print(f"💾 Записываю видеофайл с максимальным качеством...")
             try:
                 segment_clip.write_videofile(
                     str(clip_path),
                     codec='libx264',
                     audio_codec='aac',
+                    # High quality settings
+                    ffmpeg_params=[
+                        '-crf', '18',        # Visually lossless quality
+                        '-preset', 'slow',   # Better compression efficiency
+                        '-profile:v', 'high', # H.264 high profile for better quality
+                        '-level', '4.0',     # H.264 level for compatibility
+                        '-pix_fmt', 'yuv420p', # Standard pixel format for compatibility
+                        '-movflags', '+faststart', # Fast start for web playback
+                        '-b:a', '192k'       # High audio bitrate
+                    ],
                     logger=None
                 )
             except Exception as e:
@@ -686,3 +707,117 @@ def _sanitize_filename(filename: str) -> str:
         filename = "clip"
     
     return filename 
+
+async def cut_clips_vertical_async(video_path: Path, analysis: Dict, smoothing_strength: str = "very_high") -> List[Path]:
+    """
+    Async version of cut_clips_vertical that uses the AsyncVerticalCropService for concurrent processing.
+    
+    Args:
+        video_path: Path to the source video file.
+        analysis: Dictionary containing viral segments from Gemini.
+        smoothing_strength: Motion smoothing level.
+    
+    Returns:
+        A list of paths to the created vertical clips.
+    """
+    from app.services.vertical_crop_async import async_vertical_crop_service
+    
+    # Create output directory for clips
+    clips_dir = Path("clips")
+    clips_dir.mkdir(parents=True, exist_ok=True)
+    
+    # Extract viral segments
+    gemini_analysis = analysis.get("gemini_analysis", {})
+    viral_segments = gemini_analysis.get("viral_segments", [])
+    
+    if not viral_segments:
+        logging.warning("No viral segments found in analysis")
+        return []
+    
+    if not video_path.exists():
+        raise FileNotFoundError(f"Video file not found: {video_path}")
+    
+    print(f"✂️ 🔥 Создаю {len(viral_segments)} вертикальных клипов АСИНХРОННО из {video_path.name}")
+    
+    # First, cut the horizontal clips
+    horizontal_clips = cut_clips(video_path, analysis)
+    
+    if not horizontal_clips:
+        print("❌ Не удалось создать горизонтальные клипы")
+        return []
+    
+    print(f"📹 Создано {len(horizontal_clips)} горизонтальных клипов, теперь делаю их вертикальными...")
+    
+    # Start async vertical cropping tasks for all clips
+    crop_tasks = []
+    vertical_clip_paths = []
+    
+    for i, horizontal_clip_path in enumerate(horizontal_clips):
+        if not horizontal_clip_path.exists():
+            print(f"⚠️ Горизонтальный клип не найден: {horizontal_clip_path}")
+            continue
+        
+        # Generate vertical clip path
+        vertical_clip_path = clips_dir / f"{horizontal_clip_path.stem}_vertical.mp4"
+        vertical_clip_paths.append(vertical_clip_path)
+        
+        print(f"🚀 Запускаю вертикальную обрезку {i+1}/{len(horizontal_clips)}: {horizontal_clip_path.name}")
+        
+        # Start async vertical crop task
+        task = async_vertical_crop_service.create_vertical_crop_async(
+            input_video_path=horizontal_clip_path,
+            output_video_path=vertical_clip_path,
+            use_speaker_detection=True,
+            smoothing_strength=smoothing_strength
+        )
+        crop_tasks.append(task)
+    
+    if not crop_tasks:
+        print("❌ Не удалось запустить задачи вертикальной обрезки")
+        return []
+    
+    print(f"⏳ Ожидаю завершения {len(crop_tasks)} задач вертикальной обрезки...")
+    
+    # Wait for all crop tasks to complete
+    try:
+        results = await asyncio.gather(*crop_tasks, return_exceptions=True)
+        
+        successful_clips = []
+        failed_clips = 0
+        
+        for i, result in enumerate(results):
+            if isinstance(result, Exception):
+                print(f"❌ Ошибка при обрезке клипа {i+1}: {str(result)}")
+                failed_clips += 1
+            elif isinstance(result, dict) and result.get("success"):
+                output_path = Path(result["output_path"])
+                if output_path.exists():
+                    successful_clips.append(output_path)
+                    print(f"✅ Вертикальный клип создан: {output_path.name}")
+                else:
+                    print(f"⚠️ Клип успешно обработан, но файл не найден: {output_path}")
+                    failed_clips += 1
+            else:
+                print(f"❌ Неудачная обрезка клипа {i+1}: {result.get('error', 'Unknown error')}")
+                failed_clips += 1
+        
+        print(f"\n🎉 РЕЗУЛЬТАТ ВЕРТИКАЛЬНОЙ НАРЕЗКИ:")
+        print(f"✅ Создано вертикальных клипов: {len(successful_clips)}")
+        print(f"❌ Неудачных обрезок: {failed_clips}")
+        print(f"📊 Итого: {len(successful_clips)}/{len(crop_tasks)}")
+        
+        # Clean up horizontal clips (optional)
+        print(f"🧹 Очищаю промежуточные горизонтальные клипы...")
+        for horizontal_clip in horizontal_clips:
+            try:
+                if horizontal_clip.exists():
+                    horizontal_clip.unlink()
+                    print(f"  🗑️ Удален: {horizontal_clip.name}")
+            except Exception as e:
+                print(f"  ⚠️ Не удалось удалить {horizontal_clip.name}: {e}")
+        
+        return successful_clips
+        
+    except Exception as e:
+        print(f"❌ Критическая ошибка при асинхронной обрезке: {str(e)}")
+        return [] 
