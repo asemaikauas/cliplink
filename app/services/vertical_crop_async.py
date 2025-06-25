@@ -20,10 +20,68 @@ import subprocess
 from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor
 from datetime import datetime
 import threading
+from pydub.utils import mediainfo
 
 # Set up logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+# +++ NEW: State management for smooth transitions +++
+class TransitionManager:
+    """
+    Manages the state of speaker transitions to create smooth, intelligent cuts.
+    - Avoids jitter by requiring a speaker to be active for a few frames before cutting.
+    - Avoids cutting to empty space during brief pauses by holding on the last speaker.
+    """
+    def __init__(self, stability_frames: int = 5, hold_frames: int = 45):
+        self.stability_frames = stability_frames  # Frames to confirm a new speaker
+        self.hold_frames = hold_frames  # Frames to hold on last speaker during silence
+
+        self.current_speaker_key = None
+        self.candidate_speaker_key = None
+        self.last_known_speaker_key = None
+        
+        self.candidate_frames = 0
+        self.silent_frames = 0
+
+    def get_stable_target(self, active_speaker_key: Optional[str]) -> Optional[str]:
+        """
+        Takes the raw speaker detection for the current frame and returns a stable target.
+        """
+        # Case 1: A speaker is active
+        if active_speaker_key:
+            self.silent_frames = 0
+            
+            # If the active speaker is a new candidate
+            if active_speaker_key != self.current_speaker_key:
+                # If it's the same candidate as before, increment counter
+                if active_speaker_key == self.candidate_speaker_key:
+                    self.candidate_frames += 1
+                # Otherwise, reset to a new candidate
+                else:
+                    self.candidate_speaker_key = active_speaker_key
+                    self.candidate_frames = 1
+            
+            # If the candidate has been active long enough, switch to them
+            if self.candidate_frames >= self.stability_frames:
+                self.current_speaker_key = self.candidate_speaker_key
+                self.last_known_speaker_key = self.current_speaker_key
+
+        # Case 2: No speaker is active (silence)
+        else:
+            self.silent_frames += 1
+            self.candidate_speaker_key = None
+            self.candidate_frames = 0
+
+            # If silence persists for too long, switch to no target (allows for wide shot)
+            if self.silent_frames >= self.hold_frames:
+                self.current_speaker_key = None
+
+        # If there's no current speaker but there was one recently, hold on them
+        if self.current_speaker_key is None and self.last_known_speaker_key:
+            return self.last_known_speaker_key
+
+        return self.current_speaker_key
 
 class AsyncVerticalCropService:
     """
@@ -127,8 +185,29 @@ class AsyncVerticalCropService:
             
             logger.info(f"🧹 Cleaned up {len(tasks_to_remove)} old tasks")
     
-    def _detect_faces_sync(self, frame: np.ndarray) -> List[Tuple[int, int, int, int]]:
-        """Synchronous face detection for thread executor"""
+    # +++ NEW: Spatial audio analysis method +++
+    def _analyze_spatial_audio_sync(self, audio_chunk: AudioSegment) -> Dict[str, float]:
+        """Analyzes a stereo audio chunk for loudness in left and right channels."""
+        if audio_chunk.channels < 2:
+            # If mono, treat both channels as having the same loudness
+            loudness = audio_chunk.rms
+            return {"left": loudness, "right": loudness}
+
+        left_channel = audio_chunk.split_to_mono()[0]
+        right_channel = audio_chunk.split_to_mono()[1]
+
+        return {
+            "left": left_channel.rms,
+            "right": right_channel.rms
+        }
+
+    async def analyze_spatial_audio(self, audio_chunk: AudioSegment) -> Dict[str, float]:
+        """Async wrapper for spatial audio analysis."""
+        return await self._run_cpu_bound_task(self._analyze_spatial_audio_sync, audio_chunk)
+
+    # +++ MODIFIED: Detect faces and their position +++
+    def _detect_faces_sync(self, frame: np.ndarray) -> List[Dict[str, Any]]:
+        """Synchronous face detection that also determines face position (left/right)."""
         if self.face_net is None:
             return []
         
@@ -144,31 +223,35 @@ class AsyncVerticalCropService:
             for i in range(detections.shape[2]):
                 confidence = detections[0, 0, i, 2]
                 if confidence > 0.5:
-                    box = detections[0, 0, i, 3:7] * np.array([w, h, w, h])
+                    box_coords = detections[0, 0, i, 3:7] * np.array([w, h, w, h])
                     
-                    # Check for invalid values before casting
-                    if np.any(np.isnan(box)) or np.any(np.isinf(box)):
+                    if np.any(np.isnan(box_coords)) or np.any(np.isinf(box_coords)):
                         continue
                     
-                    x, y, x1, y1 = box.astype("int")
+                    x, y, x1, y1 = box_coords.astype("int")
                     
-                    # Ensure coordinates are within frame bounds
-                    x = max(0, min(w, x))
-                    y = max(0, min(h, y))
-                    x1 = max(0, min(w, x1))
-                    y1 = max(0, min(h, y1))
+                    # Ensure coordinates are valid
+                    x, y, x1, y1 = max(0, x), max(0, y), min(w, x1), min(h, y1)
+                    if not (x1 > x and y1 > y):
+                        continue
+                        
+                    face_center_x = (x + x1) / 2
+                    position = "left" if face_center_x < w / 2 else "right"
                     
-                    # Ensure valid bounding box (x1 > x and y1 > y)
-                    if x1 > x and y1 > y:
-                        faces.append((x, y, x1, y1))
+                    faces.append({
+                        "box": (x, y, x1, y1),
+                        "position": position,
+                        "id": f"{position}_{i}" # Simple unique ID for the face
+                    })
             
             return faces
         except Exception as e:
             logger.error(f"Face detection error: {e}")
             return []
-    
-    async def detect_faces(self, frame: np.ndarray) -> List[Tuple[int, int, int, int]]:
-        """Async face detection"""
+
+    # +++ MODIFIED: Async wrapper for new face detection +++
+    async def detect_faces(self, frame: np.ndarray) -> List[Dict[str, Any]]:
+        """Async face detection with position."""
         return await self._run_cpu_bound_task(self._detect_faces_sync, frame)
     
     def _detect_voice_activity_sync(self, audio_frame: bytes) -> bool:
@@ -193,8 +276,14 @@ class AsyncVerticalCropService:
         previous_crop_center: Optional[Tuple[int, int]] = None
     ) -> Optional[Tuple[int, int, int, int]]:
         """Async active speaker detection"""
-        faces = await self.detect_faces(frame)
+        faces_with_boxes = await self.detect_faces(frame)
         
+        # simplified return for now
+        if not faces_with_boxes:
+            return None
+
+        # Extract just the boxes for the old logic if needed, though it's mostly deprecated
+        faces = [f.get("box") for f in faces_with_boxes if f.get("box")]
         if not faces:
             return None
         
@@ -211,8 +300,8 @@ class AsyncVerticalCropService:
         if audio_frame:
             has_voice_activity = await self.detect_voice_activity(audio_frame)
         
-        for face in faces:
-            x, y, x1, y1 = face
+        for face_box in faces:
+            x, y, x1, y1 = face_box
             face_width = x1 - x
             face_height = y1 - y
             
@@ -242,7 +331,7 @@ class AsyncVerticalCropService:
             
             if total_score > best_score:
                 best_score = total_score
-                best_face = face
+                best_face = face_box
         
         return best_face
     
@@ -291,15 +380,17 @@ class AsyncVerticalCropService:
         
         return (smoothed_x, smoothed_y), recent_centers
     
+    # +++ MODIFIED: Cropping logic to include torso +++
     def _crop_frame_to_vertical(
         self, 
         frame: np.ndarray, 
         speaker_box: Optional[Tuple[int, int, int, int]],
         target_size: Tuple[int, int],
         crop_center: Optional[Tuple[int, int]] = None,
-        padding_factor: float = 1.5
+        padding_factor: float = 1.5, # This is now for vertical centering
+        torso_factor: float = 0.4 # How much below the face to center (0.4 = 40% of face height)
     ) -> np.ndarray:
-        """Synchronous frame cropping for thread executor"""
+        """Synchronous frame cropping, modified to better frame speaker's torso."""
         h, w = frame.shape[:2]
         target_width, target_height = target_size
         target_aspect = target_width / target_height
@@ -310,11 +401,11 @@ class AsyncVerticalCropService:
         elif speaker_box:
             x, y, x1, y1 = speaker_box
             face_center_x = (x + x1) // 2
-            face_center_y = (y + y1) // 2
             face_height = y1 - y
-            padding_y = int(face_height * padding_factor) // 2
+            
+            # ** NEW: Center below the face to include the torso **
+            crop_center_y = (y + y1) // 2 + int(face_height * torso_factor)
             crop_center_x = face_center_x
-            crop_center_y = max(face_center_y - padding_y, face_center_y)
         else:
             crop_center_x = w // 2
             crop_center_y = h // 2
@@ -360,34 +451,41 @@ class AsyncVerticalCropService:
         frame: np.ndarray, 
         speaker_box: Optional[Tuple[int, int, int, int]],
         target_size: Tuple[int, int],
-        crop_center: Optional[Tuple[int, int]] = None,
-        padding_factor: float = 1.5
+        crop_center: Optional[Tuple[int, int]] = None
     ) -> np.ndarray:
         """Async frame cropping"""
+        # Note: torso_factor and padding_factor are used by the sync version, called here.
         return await self._run_cpu_bound_task(
             self._crop_frame_to_vertical,
-            frame, speaker_box, target_size, crop_center, padding_factor
+            frame, speaker_box, target_size, crop_center
         )
     
-    def _extract_audio_sync(self, video_path: Path) -> Optional[bytes]:
-        """Synchronous audio extraction"""
+    # +++ MODIFIED: Audio extraction to keep it in stereo +++
+    def _extract_audio_sync(self, video_path: Path) -> Optional[AudioSegment]:
+        """Synchronous audio extraction, keeps audio in stereo for spatial analysis."""
         try:
-            temp_audio_path = f"temp_audio_vad_{uuid.uuid4().hex[:8]}.wav"
+            # Check if video has an audio stream first
+            video_info = mediainfo(str(video_path))
+            has_audio_stream = False
+            if 'streams' in video_info:
+                for stream in video_info['streams']:
+                    if stream.get('codec_type') == 'audio':
+                        has_audio_stream = True
+                        break
+            
+            if not has_audio_stream:
+                 logger.warning(f"⚠️ Video {video_path.name} has no audio stream.")
+                 return None
+
             audio = AudioSegment.from_file(str(video_path))
-            audio = audio.set_frame_rate(16000).set_channels(1)
-            audio.export(temp_audio_path, format="wav")
-            
-            with wave.open(temp_audio_path, 'rb') as wf:
-                audio_data = wf.readframes(wf.getnframes())
-            
-            os.remove(temp_audio_path)
-            return audio_data
+            return audio
         except Exception as e:
             logger.error(f"Audio extraction failed: {e}")
             return None
     
-    async def extract_audio_for_vad(self, video_path: Path) -> Optional[bytes]:
-        """Async audio extraction"""
+    # +++ MODIFIED: Async wrapper for stereo audio extraction +++
+    async def extract_audio_for_vad(self, video_path: Path) -> Optional[AudioSegment]:
+        """Async audio extraction for spatial analysis."""
         return await self._run_cpu_bound_task(self._extract_audio_sync, video_path)
     
     def _process_audio_frames(self, audio_data: bytes, sample_rate: int = 16000, frame_duration_ms: int = 30):
@@ -408,7 +506,8 @@ class AsyncVerticalCropService:
         output_video_path: Path,
         use_speaker_detection: bool = True,
         smoothing_strength: str = "very_high",
-        task_id: Optional[str] = None
+        task_id: Optional[str] = None,
+        intelligent_speaker_tracking: bool = True # New flag
     ) -> Dict[str, Any]:
         """
         Create vertical crop asynchronously with progress tracking
@@ -437,7 +536,8 @@ class AsyncVerticalCropService:
                 "input_path": str(input_video_path),
                 "output_path": str(output_video_path),
                 "use_speaker_detection": use_speaker_detection,
-                "smoothing_strength": smoothing_strength
+                "smoothing_strength": smoothing_strength,
+                "intelligent_speaker_tracking": intelligent_speaker_tracking
             }
         
         try:
@@ -477,19 +577,19 @@ class AsyncVerticalCropService:
             )
             
             # Extract audio if needed
-            audio_data = None
-            if use_speaker_detection and self.vad:
-                self._update_task_status(task_id, "processing", 15, "Extracting audio for voice detection...")
-                audio_data = await self.extract_audio_for_vad(input_video_path)
+            audio_segment = None
+            if intelligent_speaker_tracking:
+                self._update_task_status(task_id, "processing", 15, "Extracting stereo audio for analysis...")
+                audio_segment = await self.extract_audio_for_vad(input_video_path)
             
             # Process video
-            self._update_task_status(task_id, "processing", 20, "Starting video processing...")
+            self._update_task_status(task_id, "processing", 20, "Starting intelligent video processing...")
             
             # Run the heavy video processing in a separate task
             result = await self._process_video_frames(
                 task_id, input_video_path, output_video_path, 
-                target_size, smoothing_config, audio_data,
-                use_speaker_detection, fps, total_frames
+                target_size, smoothing_config, audio_segment,
+                use_speaker_detection, fps, total_frames, intelligent_speaker_tracking
             )
             
             if result["success"]:
@@ -527,24 +627,23 @@ class AsyncVerticalCropService:
         output_video_path: Path,
         target_size: Tuple[int, int],
         smoothing_config: Dict[str, Any],
-        audio_data: Optional[bytes],
+        audio_segment: Optional[AudioSegment],
         use_speaker_detection: bool,
         fps: int,
-        total_frames: int
+        total_frames: int,
+        intelligent_speaker_tracking: bool
     ) -> Dict[str, Any]:
-        """Process video frames with async/await pattern"""
+        """Process video frames with new intelligent speaker tracking logic."""
         try:
             # Setup temp video path
             temp_video_path = output_video_path.with_name(f"{output_video_path.stem}_temp_{task_id}.mp4")
             
+            # +++ NEW: Initialize transition manager +++
+            transition_manager = TransitionManager()
+
             # Video processing state
             previous_crop_center = None
             recent_centers = []
-            
-            # Setup audio generator
-            audio_generator = None
-            if audio_data:
-                audio_generator = self._process_audio_frames(audio_data)
             
             # Open video
             cap = cv2.VideoCapture(str(input_video_path))
@@ -554,27 +653,47 @@ class AsyncVerticalCropService:
             frame_count = 0
             last_progress_update = 0
             
+            face_map = {} # To store face boxes by ID
+
             while True:
                 ret, frame = cap.read()
                 if not ret:
                     break
                 
-                # Get audio frame
-                audio_frame = None
-                if audio_generator:
-                    try:
-                        audio_frame = next(audio_generator)
-                    except StopIteration:
-                        audio_frame = None
-                
-                # Find active speaker
-                speaker_box = None
-                if use_speaker_detection:
-                    speaker_box = await self.find_active_speaker(frame, audio_frame, previous_crop_center)
-                
+                # Default to a wide shot if no one is speaking
+                target_speaker_box = None
+
+                if intelligent_speaker_tracking and audio_segment:
+                    # 1. Get audio chunk for the current frame
+                    frame_time_ms = (frame_count / fps) * 1000
+                    audio_chunk = audio_segment[frame_time_ms : frame_time_ms + (1000/fps)]
+
+                    # 2. Analyze spatial audio
+                    spatial_loudness = await self.analyze_spatial_audio(audio_chunk)
+
+                    # 3. Detect faces and their positions
+                    faces = await self.detect_faces(frame)
+                    face_map = {face["id"]: face["box"] for face in faces}
+
+                    # 4. Select active speaker
+                    active_speaker_id = self._select_active_speaker(faces, spatial_loudness)
+                    
+                    # 5. Get stable target from transition manager
+                    stable_speaker_id = transition_manager.get_stable_target(active_speaker_id)
+
+                    # 6. Get the speaker's bounding box
+                    if stable_speaker_id:
+                        target_speaker_box = face_map.get(stable_speaker_id)
+
+                elif use_speaker_detection: # Fallback to original method
+                    faces = await self.detect_faces(frame)
+                    if faces:
+                        target_speaker_box = faces[0]["box"]
+
+                # --- Cropping Section ---
                 # Calculate crop center with smoothing
-                if speaker_box:
-                    x, y, x1, y1 = speaker_box
+                if target_speaker_box:
+                    x, y, x1, y1 = target_speaker_box
                     raw_center = ((x + x1) // 2, (y + y1) // 2)
                 else:
                     h, w = frame.shape[:2]
@@ -588,7 +707,7 @@ class AsyncVerticalCropService:
                 
                 # Crop frame
                 cropped_frame = await self.crop_frame_to_vertical(
-                    frame, speaker_box, target_size, crop_center
+                    frame, target_speaker_box, target_size, crop_center
                 )
                 
                 # Write frame
@@ -683,6 +802,32 @@ class AsyncVerticalCropService:
                 temp_video_path.rename(output_video_path)
             return False
 
+    # +++ NEW: The "Decision Engine" to select the speaker +++
+    def _select_active_speaker(
+        self,
+        faces: List[Dict[str, Any]],
+        spatial_loudness: Dict[str, float],
+        loudness_threshold: float = 100.0  # Min RMS to be considered speech
+    ) -> Optional[str]:
+        """
+        Selects the most likely active speaker by correlating face position with audio channel loudness.
+        Returns the unique ID of the winning face.
+        """
+        speaker_scores = {}
+        for face in faces:
+            position = face["position"]
+            loudness = spatial_loudness.get(position, 0)
+            
+            # Only consider faces in channels with significant sound
+            if loudness > loudness_threshold:
+                speaker_scores[face["id"]] = loudness
+
+        if not speaker_scores:
+            return None
+
+        # Return the ID of the face with the loudest corresponding channel
+        return max(speaker_scores, key=speaker_scores.get)
+
 # Global async service instance
 async_vertical_crop_service = AsyncVerticalCropService()
 
@@ -692,7 +837,8 @@ async def crop_video_to_vertical_async(
     output_path: Path,
     use_speaker_detection: bool = True,
     smoothing_strength: str = "very_high",
-    task_id: Optional[str] = None
+    task_id: Optional[str] = None,
+    intelligent_speaker_tracking: bool = True # Add new flag
 ) -> Dict[str, Any]:
     """
     Async convenience function to crop video to vertical format
@@ -701,7 +847,8 @@ async def crop_video_to_vertical_async(
         Dict with success, task_id, output_path, error keys
     """
     return await async_vertical_crop_service.create_vertical_crop_async(
-        input_path, output_path, use_speaker_detection, smoothing_strength, task_id
+        input_path, output_path, use_speaker_detection, smoothing_strength, task_id,
+        intelligent_speaker_tracking=intelligent_speaker_tracking
     )
 
 async def get_crop_task_status(task_id: str) -> Optional[Dict[str, Any]]:
