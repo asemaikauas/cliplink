@@ -1,4 +1,4 @@
-from fastapi import APIRouter, HTTPException, UploadFile, File, BackgroundTasks
+from fastapi import APIRouter, HTTPException, UploadFile, File, BackgroundTasks, Form, Request, Depends
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
 from typing import Dict, Any, List, Optional
@@ -11,6 +11,10 @@ from concurrent.futures import ThreadPoolExecutor
 import uuid
 from datetime import datetime
 import threading
+from dotenv import load_dotenv
+
+# Load environment variables
+load_dotenv()
 
 # Import our services
 from app.services.youtube import (
@@ -22,8 +26,37 @@ from app.services.gemini import analyze_transcript_with_gemini
 from app.services.vertical_crop import crop_video_to_vertical
 from app.services.vertical_crop_async import (
     crop_video_to_vertical_async,
-    async_vertical_crop_service
+    async_vertical_crop_service,
+    get_crop_task_status,
+    list_crop_tasks,
+    cleanup_old_crop_tasks,
+    # Advanced functions
+    initialize_advanced_service,
+    crop_video_advanced,
+    get_advanced_crop_task_status
 )
+
+# Helper functions
+async def download_video_temp(video_url: str) -> Path:
+    """Download video to temporary location"""
+    try:
+        # Use the existing youtube service to download
+        video_path = await _run_blocking_task(download_video, video_url, "best")
+        return video_path
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Failed to download video: {str(e)}")
+
+# Add placeholder imports for authentication (will need to be implemented)
+# For now, we'll create simple placeholder functions
+def get_current_active_user():
+    """Placeholder for user authentication dependency"""
+    return {"id": 1, "username": "test_user"}
+
+class User:
+    """Placeholder User model"""
+    def __init__(self, id: int, username: str):
+        self.id = id
+        self.username = username
 
 router = APIRouter()
 
@@ -959,4 +992,355 @@ async def health_check():
     Health check endpoint to confirm the API is running
     """
     print("🏥 Health check OK")
-    return {"status": "ok"} 
+    return {"status": "ok"}
+
+@router.post("/create-vertical-crop-advanced")
+async def create_vertical_crop_advanced(
+    request: Request,
+    background_tasks: BackgroundTasks,
+    input_video_url: str = Form(...),
+    output_filename: str = Form(None),
+    target_aspect_ratio: str = Form("9:16"),
+    use_speaker_detection: bool = Form(True),
+    hf_token: str = Form(None),  # Optional - will use env var if not provided
+    current_user: User = Depends(get_current_active_user)
+):
+    """
+    Create vertical crop using advanced AI speaker tracking (pyannote + MediaPipe + scene detection)
+    Requires HuggingFace token for speaker diarization
+    """
+    try:
+        # Parse aspect ratio
+        aspect_parts = target_aspect_ratio.split(":")
+        if len(aspect_parts) != 2:
+            raise HTTPException(status_code=400, detail="Invalid aspect ratio format. Use 'width:height' (e.g., '9:16')")
+        
+        target_ratio = (int(aspect_parts[0]), int(aspect_parts[1]))
+        
+        # Generate unique filename for output
+        if not output_filename:
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            output_filename = f"advanced_vertical_crop_{timestamp}.mp4"
+        
+        # Ensure filename has .mp4 extension
+        if not output_filename.endswith('.mp4'):
+            output_filename += '.mp4'
+        
+        # Setup paths
+        input_path = await download_video_temp(input_video_url)
+        temp_vertical_dir = Path("temp_vertical")
+        temp_vertical_dir.mkdir(exist_ok=True)
+        output_path = temp_vertical_dir / output_filename
+        
+        # Initialize advanced service with HF token
+        initialize_advanced_service(hf_token)
+        
+        # Start advanced vertical cropping
+        result = await crop_video_advanced(
+            input_path=input_path,
+            output_path=output_path,
+            hf_token=hf_token,
+            target_aspect_ratio=target_ratio
+        )
+        
+        if result["success"]:
+            # Clean up input file
+            if input_path.exists():
+                os.remove(input_path)
+            
+            return {
+                "success": True,
+                "task_id": result["task_id"],
+                "message": "Advanced vertical cropping started successfully",
+                "output_path": str(output_path),
+                "features_used": [
+                    "Pyannote Speaker Diarization",
+                    "PySceneDetect Scene Changes", 
+                    "MediaPipe + MTCNN Face Detection",
+                    "Advanced Transition Management"
+                ]
+            }
+        else:
+            # Clean up on failure
+            if input_path.exists():
+                os.remove(input_path)
+            
+            raise HTTPException(
+                status_code=500, 
+                detail=f"Advanced vertical cropping failed: {result.get('error', 'Unknown error')}"
+            )
+            
+    except Exception as e:
+        print(f"❌ Advanced vertical crop endpoint error: {str(e)}")
+        
+        # Clean up on error
+        if 'input_path' in locals() and input_path.exists():
+            os.remove(input_path)
+        
+        raise HTTPException(status_code=500, detail=f"Advanced processing failed: {str(e)}")
+
+@router.get("/advanced-task-status/{task_id}")
+async def get_advanced_task_status(
+    task_id: str,
+    current_user: User = Depends(get_current_active_user)
+):
+    """Get status of advanced vertical cropping task"""
+    try:
+        status = await get_advanced_crop_task_status(task_id)
+        
+        if not status:
+            raise HTTPException(status_code=404, detail="Advanced task not found")
+        
+        return {
+            "success": True,
+            "task_status": status
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"❌ Error getting advanced task status: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Error retrieving task status: {str(e)}")
+
+@router.get("/download-advanced-result/{task_id}")
+async def download_advanced_result(
+    task_id: str,
+    current_user: User = Depends(get_current_active_user)
+):
+    """Download the result of advanced vertical cropping task"""
+    try:
+        # Get task status to find output file
+        status = await get_advanced_crop_task_status(task_id)
+        
+        if not status:
+            raise HTTPException(status_code=404, detail="Advanced task not found")
+        
+        if status["status"] != "completed":
+            raise HTTPException(status_code=400, detail=f"Task not completed. Current status: {status['status']}")
+        
+        output_path = status.get("output_path")
+        if not output_path or not Path(output_path).exists():
+            raise HTTPException(status_code=404, detail="Advanced processed video file not found")
+        
+        # Return file for download
+        return FileResponse(
+            path=output_path,
+            media_type='video/mp4',
+            filename=f"advanced_vertical_{task_id}.mp4"
+        )
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"❌ Error downloading advanced result: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Error downloading file: {str(e)}")
+
+@router.post("/upload-vertical-crop-advanced")
+async def upload_vertical_crop_advanced(
+    background_tasks: BackgroundTasks,
+    file: UploadFile = File(...),
+    output_filename: str = Form(None),
+    target_aspect_ratio: str = Form("9:16"),
+    use_speaker_detection: bool = Form(True),
+    hf_token: str = Form(None),  # Optional - will use env var if not provided
+    current_user: User = Depends(get_current_active_user)
+):
+    """
+    Upload a video file and create vertical crop using advanced AI speaker tracking
+    Same as create-vertical-crop-advanced but with direct file upload
+    """
+    try:
+        # Validate file type
+        if not file.filename.lower().endswith(('.mp4', '.avi', '.mov', '.mkv', '.webm')):
+            raise HTTPException(
+                status_code=400,
+                detail="Unsupported file format. Please upload MP4, AVI, MOV, MKV, or WebM files."
+            )
+        
+        # Parse aspect ratio
+        aspect_parts = target_aspect_ratio.split(":")
+        if len(aspect_parts) != 2:
+            raise HTTPException(status_code=400, detail="Invalid aspect ratio format. Use 'width:height' (e.g., '9:16')")
+        
+        target_ratio = (int(aspect_parts[0]), int(aspect_parts[1]))
+        
+        # Generate unique filename for output
+        if not output_filename:
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            base_name = Path(file.filename).stem
+            output_filename = f"advanced_upload_{base_name}_{timestamp}.mp4"
+        
+        # Ensure filename has .mp4 extension
+        if not output_filename.endswith('.mp4'):
+            output_filename += '.mp4'
+        
+        # Save uploaded file temporarily
+        temp_uploads_dir = Path("temp_uploads")
+        temp_uploads_dir.mkdir(exist_ok=True)
+        
+        # Sanitize filename
+        from app.services.youtube import _sanitize_filename
+        safe_filename = _sanitize_filename(file.filename or "upload.mp4")
+        temp_input_path = temp_uploads_dir / f"upload_{uuid.uuid4().hex[:8]}_{safe_filename}"
+        
+        # Save uploaded file
+        print(f"📁 Saving uploaded file: {file.filename} ({file.size} bytes)")
+        with open(temp_input_path, "wb") as buffer:
+            content = await file.read()
+            buffer.write(content)
+        
+        # Validate file size (optional - adjust as needed)
+        file_size_mb = len(content) / (1024 * 1024)
+        max_size_mb = 500  # 500 MB limit
+        if file_size_mb > max_size_mb:
+            # Clean up
+            if temp_input_path.exists():
+                os.remove(temp_input_path)
+            raise HTTPException(
+                status_code=413,
+                detail=f"File too large ({file_size_mb:.1f} MB). Maximum size is {max_size_mb} MB."
+            )
+        
+        # Setup output path
+        temp_vertical_dir = Path("temp_vertical")
+        temp_vertical_dir.mkdir(exist_ok=True)
+        output_path = temp_vertical_dir / output_filename
+        
+        print(f"🚀 Starting advanced vertical crop for uploaded file:")
+        print(f"   📹 Input: {file.filename} ({file_size_mb:.1f} MB)")
+        print(f"   📱 Output: {output_filename}")
+        print(f"   🎯 Aspect ratio: {target_aspect_ratio}")
+        print(f"   🔊 Speaker detection: {use_speaker_detection}")
+        
+        # Initialize advanced service (will use HF CLI auth if no token provided)
+        initialize_advanced_service(hf_token)
+        
+        # Start advanced vertical cropping
+        result = await crop_video_advanced(
+            input_path=temp_input_path,
+            output_path=output_path,
+            target_aspect_ratio=target_ratio,
+            hf_token=hf_token
+        )
+        
+        # Clean up input file in background after processing starts
+        def cleanup_input_file():
+            try:
+                if temp_input_path.exists():
+                    os.remove(temp_input_path)
+                    print(f"🧹 Cleaned up temporary input file: {temp_input_path}")
+            except Exception as e:
+                print(f"⚠️ Failed to clean up input file: {e}")
+        
+        background_tasks.add_task(cleanup_input_file)
+        
+        if result["success"]:
+            return {
+                "success": True,
+                "task_id": result["task_id"],
+                "message": "Advanced vertical cropping started successfully for uploaded file",
+                "uploaded_file": {
+                    "filename": file.filename,
+                    "size_mb": round(file_size_mb, 2)
+                },
+                "output_path": str(output_path),
+                "processing_features": [
+                    "Pyannote Speaker Diarization",
+                    "PySceneDetect Scene Changes", 
+                    "MediaPipe + MTCNN Face Detection",
+                    "Advanced Transition Management"
+                ],
+                "status_endpoint": f"/workflow/advanced-task-status/{result['task_id']}",
+                "download_endpoint": f"/workflow/download-advanced-result/{result['task_id']}",
+                "estimated_time": "5-15 minutes depending on video length"
+            }
+        else:
+            # Clean up on failure
+            if temp_input_path.exists():
+                os.remove(temp_input_path)
+            
+            raise HTTPException(
+                status_code=500, 
+                detail=f"Advanced vertical cropping failed: {result.get('error', 'Unknown error')}"
+            )
+            
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"❌ Upload vertical crop endpoint error: {str(e)}")
+        
+        # Clean up on error
+        if 'temp_input_path' in locals() and temp_input_path.exists():
+            os.remove(temp_input_path)
+        
+        raise HTTPException(status_code=500, detail=f"Upload processing failed: {str(e)}")
+
+@router.post("/test-hf-connection")
+async def test_hf_connection(
+    hf_token: str = Form(None),  # Optional - will use env var if not provided
+    current_user: User = Depends(get_current_active_user)
+):
+    """Test HuggingFace token and pyannote access"""
+    try:
+        # Use environment token if none provided
+        token = hf_token or os.getenv('HF_TOKEN')
+        if not token:
+            return {
+                "success": False,
+                "error": "No HuggingFace token provided and HF_TOKEN not set in environment",
+                "message": "Please provide a token or set HF_TOKEN in your .env file"
+            }
+        
+        print(f"🔍 Testing HuggingFace connection with token: {token[:10]}...")
+        
+        from huggingface_hub import HfApi
+        
+        # Test HF API connection
+        api = HfApi()
+        user_info = api.whoami(token=token)
+        print(f"✅ HuggingFace API connection successful for user: {user_info.get('name', 'Unknown')}")
+        
+        # Test pyannote model access
+        try:
+            print("🔍 Testing pyannote model access...")
+            from pyannote.audio import Pipeline
+            pipeline = Pipeline.from_pretrained(
+                "pyannote/speaker-diarization-3.1",
+                use_auth_token=token
+            )
+            pipeline_status = "✅ Accessible"
+            print("✅ Pyannote model access successful")
+        except Exception as e:
+            pipeline_status = f"❌ Error: {str(e)}"
+            print(f"❌ Pyannote model access failed: {e}")
+        
+        return {
+            "success": True,
+            "hf_user": user_info.get("name", "Unknown"),
+            "token_valid": True,
+            "pyannote_access": pipeline_status,
+            "required_models": [
+                "pyannote/speaker-diarization-3.1",
+                "pyannote/segmentation-3.0", 
+                "pyannote/embedding"
+            ],
+            "recommendations": [
+                "Ensure you have accepted the license agreement for pyannote models on HuggingFace",
+                "Check that your token has read access to the models",
+                "Verify your internet connection for model download"
+            ]
+        }
+        
+    except Exception as e:
+        print(f"❌ HuggingFace connection test failed: {e}")
+        return {
+            "success": False,
+            "error": str(e),
+            "message": "HuggingFace token validation failed. Please check your token and model access.",
+            "troubleshooting": [
+                "Verify your HuggingFace token is correct",
+                "Ensure you have accepted the license agreements for pyannote models",
+                "Check your internet connection",
+                "Make sure your token has read permissions"
+            ]
+        } 

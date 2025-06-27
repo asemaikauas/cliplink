@@ -1,44 +1,98 @@
-from fastapi import FastAPI
-from app.routers import transcript, workflow
+"""
+ClipsAI Backend - FastAPI Application
+Advanced video processing with AI speaker tracking, scene detection, and vertical cropping
+"""
+
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from dotenv import load_dotenv
+from fastapi.responses import JSONResponse
+import uvicorn
+import os
 from pathlib import Path
 
-env_path = Path(__file__).parent.parent / '.env'
-load_dotenv(dotenv_path=env_path)
+# Import routers
+from app.routers import workflow
 
+# Create FastAPI app
 app = FastAPI(
-    title="ClipLink API",
-    description="YouTube transcript extraction, Gemini AI analysis, and video clip generation",
-    version="1.0.0"
+    title="ClipsAI Backend",
+    description="Advanced video processing with AI speaker tracking, scene detection, and vertical cropping",
+    version="1.0.0",
+    docs_url="/docs",
+    redoc_url="/redoc"
 )
 
+# Configure CORS
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=["*"],  # Configure this properly for production
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
+# Include routers
+app.include_router(workflow.router, prefix="/workflow", tags=["workflow"])
+
+# Root endpoint
 @app.get("/")
-def read_root():
+async def root():
+    """Root endpoint with API information"""
     return {
-        "message": "ClipLink API", 
-        "endpoints": {
-            "transcript": "/transcript - Extract transcript from YouTube URL",
-            "analyze": "/analyze - Analyze transcript with Gemini AI",
-            "workflow": {
-                "process_complete": "/workflow/process-complete - Full workflow: transcript → analysis → download → clips",
-                "analyze_only": "/workflow/analyze-only - Only transcript + analysis"
-            }
-        }
+        "message": "ClipsAI Backend API",
+        "version": "1.0.0",
+        "features": [
+            "Advanced Speaker Diarization (pyannote.audio)",
+            "Scene Change Detection (PySceneDetect)",
+            "Face Detection (MediaPipe + MTCNN)",
+            "Intelligent Transition Management",
+            "Vertical Video Cropping (9:16)",
+            "YouTube Video Processing",
+            "Async Task Management"
+        ],
+        "docs": "/docs",
+        "health": "/workflow/health"
     }
 
-@app.get("/health")
-def health_check():
-    return {"status": "healthy", "service": "cliplink_api"}
+# Global exception handler
+@app.exception_handler(Exception)
+async def global_exception_handler(request, exc):
+    return JSONResponse(
+        status_code=500,
+        content={
+            "error": "Internal server error",
+            "message": str(exc),
+            "path": str(request.url)
+        }
+    )
 
-# Include routers
-app.include_router(transcript.router)
-app.include_router(workflow.router, prefix="/workflow", tags=["workflow"])
+# Startup event
+@app.on_event("startup")
+async def startup_event():
+    """Initialize application on startup"""
+    print("🚀 ClipsAI Backend starting up...")
+    
+    # Create necessary directories
+    directories = ["clips", "downloads", "temp_uploads", "temp_vertical", "models"]
+    for dir_name in directories:
+        Path(dir_name).mkdir(exist_ok=True)
+        print(f"📁 Created directory: {dir_name}")
+    
+    print("✅ ClipsAI Backend ready!")
+
+# Shutdown event
+@app.on_event("shutdown")
+async def shutdown_event():
+    """Cleanup on shutdown"""
+    print("🛑 ClipsAI Backend shutting down...")
+    # Add any cleanup code here
+    print("✅ Shutdown complete!")
+
+if __name__ == "__main__":
+    # Run with uvicorn
+    uvicorn.run(
+        "app.main:app",
+        host=os.getenv("HOST", "0.0.0.0"),
+        port=int(os.getenv("PORT", 8000)),
+        reload=os.getenv("DEBUG", "false").lower() == "true"
+    )

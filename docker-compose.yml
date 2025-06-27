@@ -1,0 +1,75 @@
+version: '3.8'
+
+services:
+  cliplink-backend:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: cliplink-app
+    ports:
+      - "8000:8000"
+    volumes:
+      # Mount directories for persistent storage
+      - ./clips:/app/clips
+      - ./downloads:/app/downloads
+      - ./temp_uploads:/app/temp_uploads
+      - ./temp_vertical:/app/temp_vertical
+      - ./models:/app/models
+      # Mount source code for development (comment out for production)
+      - ./app:/app/app
+    environment:
+      # Environment variables
+      - PYTHONPATH=/app
+      - ENVIRONMENT=development
+      # Add your HuggingFace token here or use .env file
+      - HF_TOKEN=${HF_TOKEN:-}
+      # Add any other environment variables
+      - MAX_WORKERS=4
+      - MAX_CONCURRENT_TASKS=10
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/workflow/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+    # Uncomment for GPU support (requires nvidia-docker)
+    # deploy:
+    #   resources:
+    #     reservations:
+    #       devices:
+    #         - driver: nvidia
+    #           count: 1
+    #           capabilities: [gpu]
+
+  # Optional: Add Redis for caching and task queue
+  # redis:
+  #   image: redis:7-alpine
+  #   container_name: cliplink-redis
+  #   ports:
+  #     - "6379:6379"
+  #   volumes:
+  #     - redis-data:/data
+  #   restart: unless-stopped
+
+  # Optional: Add PostgreSQL database
+  # postgres:
+  #   image: postgres:15-alpine
+  #   container_name: cliplink-db
+  #   environment:
+  #     - POSTGRES_DB=cliplink
+  #     - POSTGRES_USER=cliplink
+  #     - POSTGRES_PASSWORD=cliplink_password
+  #   volumes:
+  #     - postgres-data:/var/lib/postgresql/data
+  #   ports:
+  #     - "5432:5432"
+  #   restart: unless-stopped
+
+volumes:
+  # Uncomment if using optional services
+  # redis-data:
+  # postgres-data:
+  clips-data:
+  downloads-data:
+  temp-data: 

@@ -1,149 +1,469 @@
 """
-Asynchronous vertical cropping service for creating YouTube Shorts (9:16 aspect ratio)
-Designed to handle multiple concurrent requests without blocking
+Advanced Vertical Cropping Service - ClipsAI Inspired
+Utilizes state-of-the-art speaker diarization, scene detection, and face tracking
 """
 
 import asyncio
 import cv2
 import numpy as np
 import os
-import logging
 import uuid
 from pathlib import Path
-from typing import Optional, Tuple, List, Dict, Any
-import webrtcvad
-import wave
-import contextlib
-from pydub import AudioSegment
-from moviepy import VideoFileClip, AudioFileClip
-import subprocess
-from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor
+from typing import Optional, Tuple, List, Dict, Any, Union
+import torch
+import torchaudio
 from datetime import datetime
 import threading
-from pydub.utils import mediainfo
+from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor
+from dotenv import load_dotenv
 
-# Set up logging
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+# Load environment variables
+load_dotenv()
 
-# +++ NEW: State management for smooth transitions +++
-class TransitionManager:
+from pyannote.audio import Pipeline
+from pyannote.core import Segment, Annotation
+import scenedetect
+from scenedetect import detect, ContentDetector, split_video_ffmpeg
+import mediapipe as mp
+from mtcnn import MTCNN
+import librosa
+from huggingface_hub import hf_hub_download
+from transformers import pipeline
+
+from moviepy import VideoFileClip
+from pydub import AudioSegment
+import subprocess
+
+class AdvancedSpeakerTracker:
     """
-    Manages the state of speaker transitions to create smooth, intelligent cuts.
-    - Avoids jitter by requiring a speaker to be active for a few frames before cutting.
-    - Avoids cutting to empty space during brief pauses by holding on the last speaker.
-    """
-    def __init__(self, stability_frames: int = 5, hold_frames: int = 45):
-        self.stability_frames = stability_frames  # Frames to confirm a new speaker
-        self.hold_frames = hold_frames  # Frames to hold on last speaker during silence
-
-        self.current_speaker_key = None
-        self.candidate_speaker_key = None
-        self.last_known_speaker_key = None
-        
-        self.candidate_frames = 0
-        self.silent_frames = 0
-
-    def get_stable_target(self, active_speaker_key: Optional[str]) -> Optional[str]:
-        """
-        Takes the raw speaker detection for the current frame and returns a stable target.
-        """
-        # Case 1: A speaker is active
-        if active_speaker_key:
-            self.silent_frames = 0
-            
-            # If the active speaker is a new candidate
-            if active_speaker_key != self.current_speaker_key:
-                # If it's the same candidate as before, increment counter
-                if active_speaker_key == self.candidate_speaker_key:
-                    self.candidate_frames += 1
-                # Otherwise, reset to a new candidate
-                else:
-                    self.candidate_speaker_key = active_speaker_key
-                    self.candidate_frames = 1
-            
-            # If the candidate has been active long enough, switch to them
-            if self.candidate_frames >= self.stability_frames:
-                self.current_speaker_key = self.candidate_speaker_key
-                self.last_known_speaker_key = self.current_speaker_key
-
-        # Case 2: No speaker is active (silence)
-        else:
-            self.silent_frames += 1
-            self.candidate_speaker_key = None
-            self.candidate_frames = 0
-
-            # If silence persists for too long, switch to no target (allows for wide shot)
-            if self.silent_frames >= self.hold_frames:
-                self.current_speaker_key = None
-
-        # If there's no current speaker but there was one recently, hold on them
-        if self.current_speaker_key is None and self.last_known_speaker_key:
-            return self.last_known_speaker_key
-
-        return self.current_speaker_key
-
-class AsyncVerticalCropService:
-    """
-    Asynchronous service for creating vertical (9:16) crops of videos with intelligent speaker tracking
-    Supports concurrent processing of multiple requests
+    Advanced speaker tracking using pyannote.audio for speaker diarization
     """
     
-    def __init__(self, max_workers: int = 4, max_concurrent_tasks: int = 10):
-        # Thread pool for CPU-intensive tasks
-        self.thread_executor = ThreadPoolExecutor(max_workers=max_workers)
+    def __init__(self, hf_token: Optional[str] = None):
+        # Get HF token from environment if not provided
+        self.hf_token = hf_token or os.getenv('HF_TOKEN')
         
-        # Process pool for very heavy operations
+        if not self.hf_token:
+            print("❌ No HuggingFace token found. Please set HF_TOKEN in your .env file")
+            print("   Get your token from: https://huggingface.co/settings/tokens")
+            
+        self.pipeline = None
+        self.speaker_embeddings = {}
+        self.initialization_attempted = False
+        self.initialize_pipeline()
+    
+    def initialize_pipeline(self):
+        """Initialize pyannote speaker diarization pipeline"""
+        if self.initialization_attempted:
+            return
+            
+        self.initialization_attempted = True
+        try:
+            print("🔍 Initializing pyannote speaker diarization pipeline...")
+            
+            # Use HuggingFace CLI authentication (preferred method)
+            # If token is provided, use it; otherwise rely on HF CLI login
+            kwargs = {}
+            if self.hf_token and self.hf_token != 'your_huggingface_token_here':
+                print(f"   Using provided token: {self.hf_token[:10]}...")
+                kwargs['use_auth_token'] = self.hf_token
+            else:
+                print("   Using HuggingFace CLI authentication...")
+            
+            # Use the latest speaker diarization pipeline
+            self.pipeline = Pipeline.from_pretrained(
+                "pyannote/speaker-diarization-3.1",
+                **kwargs
+            )
+            
+            # Send pipeline to GPU if available
+            if torch.cuda.is_available():
+                self.pipeline.to(torch.device("cuda"))
+                print("🚀 Speaker diarization pipeline loaded on GPU")
+            else:
+                print("🚀 Speaker diarization pipeline loaded on CPU")
+                
+        except Exception as e:
+            print(f"❌ Failed to initialize speaker diarization: {e}")
+            print(f"ℹ️  This might be due to:")
+            print(f"   • HuggingFace authentication not set up (run: huggingface-cli login)")
+            print(f"   • Missing license acceptance for pyannote models")
+            print(f"   • Network connectivity issues")
+            print(f"   • Model access restrictions")
+            print(f"🔄 Advanced cropping will proceed with face-detection only")
+            self.pipeline = None
+    
+    def retry_initialization(self, new_token: str = None):
+        """Retry pipeline initialization with optional new token"""
+        if new_token:
+            self.hf_token = new_token
+        self.initialization_attempted = False
+        self.initialize_pipeline()
+    
+    def test_model_access(self):
+        """Test access to pyannote models"""
+        try:
+            from pyannote.audio import Model, Inference
+            
+            # Test segmentation model
+            print("📥 Testing pyannote/segmentation-3.0...")
+            model = Model.from_pretrained("pyannote/segmentation-3.0")
+            inference = Inference(model)
+            print("✅ Segmentation model accessible")
+            
+            # Test speaker diarization
+            print("📥 Testing pyannote/speaker-diarization-3.1...")
+            pipeline = Pipeline.from_pretrained("pyannote/speaker-diarization-3.1")
+            print("✅ Speaker diarization pipeline accessible")
+            
+            return True
+            
+        except Exception as e:
+            print(f"❌ Model access test failed: {e}")
+            return False
+    
+    async def analyze_speakers(self, audio_path: Path) -> Annotation:
+        """
+        Perform speaker diarization on audio file
+        Returns pyannote Annotation with speaker segments
+        """
+        if not self.pipeline:
+            print("⚠️ Speaker diarization pipeline not available, returning empty annotation")
+            return Annotation()
+        
+        try:
+            print(f"🎤 Starting speaker diarization analysis on: {audio_path}")
+            
+            # Load audio
+            waveform, sample_rate = torchaudio.load(str(audio_path))
+            
+            # Resample to 16kHz if needed
+            if sample_rate != 16000:
+                resampler = torchaudio.transforms.Resample(sample_rate, 16000)
+                waveform = resampler(waveform)
+            
+            # Create input dict for pyannote
+            audio_input = {
+                "waveform": waveform,
+                "sample_rate": 16000
+            }
+            
+            # Perform diarization
+            diarization = self.pipeline(audio_input)
+            
+            print(f"✅ Speaker diarization completed: {len(list(diarization.itertracks()))} speaker segments")
+            return diarization
+            
+        except Exception as e:
+            print(f"❌ Speaker diarization failed: {e}")
+            print("🔄 Falling back to face-detection only mode")
+            return Annotation()
+    
+    def get_active_speaker_at_time(self, diarization: Annotation, timestamp: float) -> Optional[str]:
+        """Get the active speaker at a specific timestamp"""
+        for segment, _, speaker in diarization.itertracks(yield_label=True):
+            if segment.start <= timestamp <= segment.end:
+                return speaker
+        return None
+
+
+class AdvancedSceneDetector:
+    """
+    Scene change detection using PySceneDetect
+    """
+    
+    def __init__(self, threshold: float = 30.0):
+        self.threshold = threshold
+    
+    async def detect_scenes(self, video_path: Path) -> List[Tuple[float, float]]:
+        """
+        Detect scene changes in video
+        Returns list of (start_time, end_time) tuples
+        """
+        try:
+            # Detect scenes using content detector
+            scene_list = detect(str(video_path), ContentDetector(threshold=self.threshold))
+            
+            # Convert to time tuples
+            scenes = []
+            for scene in scene_list:
+                start_time = scene[0].get_seconds()
+                end_time = scene[1].get_seconds()
+                scenes.append((start_time, end_time))
+            
+            print(f"✅ Detected {len(scenes)} scenes")
+            return scenes
+            
+        except Exception as e:
+            print(f"❌ Scene detection failed: {e}")
+            return [(0.0, float('inf'))]  # Single scene fallback
+
+
+class AdvancedFaceDetector:
+    """
+    Advanced face detection using MediaPipe and MTCNN
+    """
+    
+    def __init__(self):
+        # Initialize MediaPipe Face Detection
+        mp_face_detection = mp.solutions.face_detection
+        self.mp_face_detection = mp_face_detection.FaceDetection(
+            model_selection=1,  # 0 for short range, 1 for full range
+            min_detection_confidence=0.5
+        )
+        
+        # Initialize MTCNN for backup
+        try:
+            self.mtcnn = MTCNN(min_face_size=40, thresholds=[0.6, 0.7, 0.8])
+            print("✅ MTCNN face detector initialized")
+        except Exception as e:
+            print(f"⚠️ MTCNN initialization failed: {e}")
+            self.mtcnn = None
+        
+        print("✅ MediaPipe face detector initialized")
+    
+    def detect_faces_mediapipe(self, frame: np.ndarray) -> List[Dict[str, Any]]:
+        """Detect faces using MediaPipe"""
+        try:
+            rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            results = self.mp_face_detection.process(rgb_frame)
+            
+            faces = []
+            if results.detections:
+                h, w = frame.shape[:2]
+                for i, detection in enumerate(results.detections):
+                    bbox = detection.location_data.relative_bounding_box
+                    
+                    # Convert relative coordinates to absolute
+                    x = int(bbox.xmin * w)
+                    y = int(bbox.ymin * h)
+                    width = int(bbox.width * w)
+                    height = int(bbox.height * h)
+                    
+                    x1, y1 = x + width, y + height
+                    
+                    # Ensure coordinates are valid
+                    x, y = max(0, x), max(0, y)
+                    x1, y1 = min(w, x1), min(h, y1)
+                    
+                    if x1 > x and y1 > y:
+                        face_center_x = (x + x1) / 2
+                        position = "left" if face_center_x < w / 2 else "right"
+                        
+                        faces.append({
+                            "box": (x, y, x1, y1),
+                            "position": position,
+                            "confidence": detection.score[0],
+                            "id": f"mp_{position}_{i}",
+                            "landmarks": self._extract_landmarks(detection, w, h)
+                        })
+            
+            return faces
+            
+        except Exception as e:
+            print(f"MediaPipe face detection error: {e}")
+            return []
+    
+    def detect_faces_mtcnn(self, frame: np.ndarray) -> List[Dict[str, Any]]:
+        """Detect faces using MTCNN as backup"""
+        if not self.mtcnn:
+            return []
+        
+        try:
+            rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            detections = self.mtcnn.detect_faces(rgb_frame)
+            
+            faces = []
+            h, w = frame.shape[:2]
+            
+            for i, detection in enumerate(detections):
+                if detection['confidence'] > 0.5:
+                    bbox = detection['box']
+                    x, y, width, height = bbox
+                    x1, y1 = x + width, y + height
+                    
+                    # Ensure coordinates are valid
+                    x, y = max(0, x), max(0, y)
+                    x1, y1 = min(w, x1), min(h, y1)
+                    
+                    if x1 > x and y1 > y:
+                        face_center_x = (x + x1) / 2
+                        position = "left" if face_center_x < w / 2 else "right"
+                        
+                        faces.append({
+                            "box": (x, y, x1, y1),
+                            "position": position,
+                            "confidence": detection['confidence'],
+                            "id": f"mtcnn_{position}_{i}",
+                            "landmarks": detection.get('keypoints', {})
+                        })
+            
+            return faces
+            
+        except Exception as e:
+            print(f"MTCNN face detection error: {e}")
+            return []
+    
+    def _extract_landmarks(self, detection, width: int, height: int) -> Dict[str, Tuple[int, int]]:
+        """Extract facial landmarks from MediaPipe detection"""
+        landmarks = {}
+        if hasattr(detection, 'location_data') and hasattr(detection.location_data, 'relative_keypoints'):
+            for i, keypoint in enumerate(detection.location_data.relative_keypoints):
+                x = int(keypoint.x * width)
+                y = int(keypoint.y * height)
+                landmarks[f"point_{i}"] = (x, y)
+        return landmarks
+    
+    async def detect_faces(self, frame: np.ndarray) -> List[Dict[str, Any]]:
+        """Main face detection method - tries MediaPipe first, then MTCNN"""
+        faces = self.detect_faces_mediapipe(frame)
+        
+        # If MediaPipe fails or finds no faces, try MTCNN
+        if not faces and self.mtcnn:
+            faces = self.detect_faces_mtcnn(frame)
+        
+        return faces
+
+
+class AdvancedTransitionManager:
+    """
+    Intelligent transition management with scene awareness
+    """
+    
+    def __init__(self, stability_frames: int = 8, hold_frames: int = 60, scene_change_reset: bool = True):
+        self.stability_frames = stability_frames
+        self.hold_frames = hold_frames
+        self.scene_change_reset = scene_change_reset
+        
+        self.current_speaker = None
+        self.candidate_speaker = None
+        self.last_known_speaker = None
+        self.candidate_frames = 0
+        self.silent_frames = 0
+        self.current_scene_start = 0.0
+        
+        # Speaker confidence tracking
+        self.speaker_confidence_history = []
+        self.confidence_window = 10
+    
+    def reset_for_scene_change(self, scene_start_time: float):
+        """Reset transition state when scene changes"""
+        if self.scene_change_reset:
+            self.current_scene_start = scene_start_time
+            self.current_speaker = None
+            self.candidate_speaker = None
+            self.candidate_frames = 0
+            self.silent_frames = 0
+            self.speaker_confidence_history = []
+            print(f"🎬 Scene change at {scene_start_time:.2f}s - resetting speaker tracking")
+    
+    def get_stable_target(
+        self, 
+        active_speaker: Optional[str], 
+        confidence: float = 1.0,
+        timestamp: float = 0.0
+    ) -> Optional[str]:
+        """Enhanced stable target selection with confidence scoring"""
+        
+        # Track confidence history
+        self.speaker_confidence_history.append({
+            'speaker': active_speaker,
+            'confidence': confidence,
+            'timestamp': timestamp
+        })
+        
+        if len(self.speaker_confidence_history) > self.confidence_window:
+            self.speaker_confidence_history.pop(0)
+        
+        # Case 1: Active speaker detected
+        if active_speaker and confidence > 0.6:
+            self.silent_frames = 0
+            
+            # Calculate average confidence for this speaker
+            recent_confidences = [
+                h['confidence'] for h in self.speaker_confidence_history[-5:]
+                if h['speaker'] == active_speaker
+            ]
+            avg_confidence = np.mean(recent_confidences) if recent_confidences else confidence
+            
+            # Higher confidence threshold for speaker changes
+            if active_speaker != self.current_speaker:
+                if active_speaker == self.candidate_speaker:
+                    self.candidate_frames += 1
+                else:
+                    self.candidate_speaker = active_speaker
+                    self.candidate_frames = 1
+                
+                # Require higher stability for speaker changes
+                required_frames = max(self.stability_frames, int(self.stability_frames * (2.0 - avg_confidence)))
+                
+                if self.candidate_frames >= required_frames:
+                    self.current_speaker = self.candidate_speaker
+                    self.last_known_speaker = self.current_speaker
+                    print(f"🎤 Speaker changed to {self.current_speaker} (confidence: {avg_confidence:.2f})")
+        
+        # Case 2: No clear speaker (silence or low confidence)
+        else:
+            self.silent_frames += 1
+            self.candidate_speaker = None
+            self.candidate_frames = 0
+            
+            # Return to wide shot after extended silence
+            if self.silent_frames >= self.hold_frames:
+                self.current_speaker = None
+        
+        # Hold on last known speaker during brief silence
+        if self.current_speaker is None and self.last_known_speaker:
+            return self.last_known_speaker
+        
+        return self.current_speaker
+
+
+class AdvancedVerticalCropService:
+    """
+    Advanced vertical cropping service using state-of-the-art AI tools
+    """
+    
+    def __init__(self, hf_token: Optional[str] = None, max_workers: int = 4, max_concurrent_tasks: int = 10):
+        # Get HF token from environment if not provided
+        self.hf_token = hf_token or os.getenv('HF_TOKEN')
+        
+        if self.hf_token:
+            print(f"🔧 Creating AdvancedVerticalCropService with token: {self.hf_token[:10]}...")
+        else:
+            print("⚠️ Creating AdvancedVerticalCropService without HF token (face-detection only)")
+        
+        self.max_workers = max_workers
+        self.max_concurrent_tasks = max_concurrent_tasks
+        
+        # Initialize components
+        print("🎤 Initializing speaker tracker...")
+        self.speaker_tracker = AdvancedSpeakerTracker(self.hf_token)
+        
+        print("🎬 Initializing scene detector...")
+        self.scene_detector = AdvancedSceneDetector()
+        
+        print("👤 Initializing face detector...")
+        self.face_detector = AdvancedFaceDetector()
+        
+        # Threading
+        self.thread_executor = ThreadPoolExecutor(max_workers=max_workers)
         self.process_executor = ProcessPoolExecutor(max_workers=min(4, max_workers))
         
         # Task tracking
         self.active_tasks: Dict[str, Dict[str, Any]] = {}
         self.task_lock = threading.Lock()
-        self.max_concurrent_tasks = max_concurrent_tasks
         
-        # Initialize VAD for voice activity detection
-        try:
-            self.vad = webrtcvad.Vad(2)  # Aggressiveness mode 0-3
-            logger.info("✅ Voice Activity Detection initialized")
-        except Exception as e:
-            logger.warning(f"⚠️ Could not initialize VAD: {e}")
-            self.vad = None
-        
-        # Try to load OpenCV DNN model for face detection
-        self.face_net = self._load_face_detection_model()
-        
-        logger.info(f"🚀 AsyncVerticalCropService initialized with {max_workers} workers, max {max_concurrent_tasks} concurrent tasks")
-    
-    def _load_face_detection_model(self):
-        """Load OpenCV DNN model for face detection (thread-safe)"""
-        try:
-            prototxt_path = "models/deploy.prototxt"
-            model_path = "models/res10_300x300_ssd_iter_140000_fp16.caffemodel"
-            
-            if Path(prototxt_path).exists() and Path(model_path).exists():
-                net = cv2.dnn.readNetFromCaffe(prototxt_path, model_path)
-                logger.info("✅ Face detection model loaded")
-                return net
-            else:
-                logger.warning("⚠️ Face detection models not found. Using center-crop fallback.")
-                return None
-        except Exception as e:
-            logger.warning(f"⚠️ Could not load face detection model: {e}")
-            return None
+        print(f"🚀 AdvancedVerticalCropService initialized successfully")
     
     async def _run_cpu_bound_task(self, func, *args, **kwargs):
         """Run CPU-bound task in thread executor"""
         loop = asyncio.get_event_loop()
         return await loop.run_in_executor(self.thread_executor, func, *args, **kwargs)
     
-    async def _run_heavy_task(self, func, *args, **kwargs):
-        """Run very heavy task in process executor"""
-        loop = asyncio.get_event_loop()
-        return await loop.run_in_executor(self.process_executor, func, *args, **kwargs)
-    
     def _create_task_id(self) -> str:
         """Generate unique task ID"""
-        return f"crop_{uuid.uuid4().hex[:8]}"
+        return f"adv_crop_{uuid.uuid4().hex[:8]}"
     
     def _update_task_status(self, task_id: str, status: str, progress: int = 0, message: str = "", data: Optional[Dict] = None):
         """Thread-safe task status update"""
@@ -158,359 +478,15 @@ class AsyncVerticalCropService:
                 if data:
                     self.active_tasks[task_id].update(data)
     
-    async def get_task_status(self, task_id: str) -> Optional[Dict[str, Any]]:
-        """Get task status by ID"""
-        with self.task_lock:
-            return self.active_tasks.get(task_id, None)
-    
-    async def list_active_tasks(self) -> Dict[str, Dict[str, Any]]:
-        """List all active tasks"""
-        with self.task_lock:
-            return self.active_tasks.copy()
-    
-    async def cleanup_completed_tasks(self, max_age_hours: int = 24):
-        """Clean up old completed tasks"""
-        cutoff_time = datetime.now().timestamp() - (max_age_hours * 3600)
-        
-        with self.task_lock:
-            tasks_to_remove = []
-            for task_id, task_info in self.active_tasks.items():
-                if task_info.get("status") in ["completed", "failed"]:
-                    created_time = task_info.get("created_at", datetime.now()).timestamp()
-                    if created_time < cutoff_time:
-                        tasks_to_remove.append(task_id)
-            
-            for task_id in tasks_to_remove:
-                del self.active_tasks[task_id]
-            
-            logger.info(f"🧹 Cleaned up {len(tasks_to_remove)} old tasks")
-    
-    # +++ NEW: Spatial audio analysis method +++
-    def _analyze_spatial_audio_sync(self, audio_chunk: AudioSegment) -> Dict[str, float]:
-        """Analyzes a stereo audio chunk for loudness in left and right channels."""
-        if audio_chunk.channels < 2:
-            # If mono, treat both channels as having the same loudness
-            loudness = audio_chunk.rms
-            return {"left": loudness, "right": loudness}
-
-        left_channel = audio_chunk.split_to_mono()[0]
-        right_channel = audio_chunk.split_to_mono()[1]
-
-        return {
-            "left": left_channel.rms,
-            "right": right_channel.rms
-        }
-
-    async def analyze_spatial_audio(self, audio_chunk: AudioSegment) -> Dict[str, float]:
-        """Async wrapper for spatial audio analysis."""
-        return await self._run_cpu_bound_task(self._analyze_spatial_audio_sync, audio_chunk)
-
-    # +++ MODIFIED: Detect faces and their position +++
-    def _detect_faces_sync(self, frame: np.ndarray) -> List[Dict[str, Any]]:
-        """Synchronous face detection that also determines face position (left/right)."""
-        if self.face_net is None:
-            return []
-        
-        try:
-            h, w = frame.shape[:2]
-            blob = cv2.dnn.blobFromImage(
-                cv2.resize(frame, (300, 300)), 1.0, (300, 300), (104.0, 177.0, 123.0)
-            )
-            self.face_net.setInput(blob)
-            detections = self.face_net.forward()
-            
-            faces = []
-            for i in range(detections.shape[2]):
-                confidence = detections[0, 0, i, 2]
-                if confidence > 0.5:
-                    box_coords = detections[0, 0, i, 3:7] * np.array([w, h, w, h])
-                    
-                    if np.any(np.isnan(box_coords)) or np.any(np.isinf(box_coords)):
-                        continue
-                    
-                    x, y, x1, y1 = box_coords.astype("int")
-                    
-                    # Ensure coordinates are valid
-                    x, y, x1, y1 = max(0, x), max(0, y), min(w, x1), min(h, y1)
-                    if not (x1 > x and y1 > y):
-                        continue
-                        
-                    face_center_x = (x + x1) / 2
-                    position = "left" if face_center_x < w / 2 else "right"
-                    
-                    faces.append({
-                        "box": (x, y, x1, y1),
-                        "position": position,
-                        "id": f"{position}_{i}" # Simple unique ID for the face
-                    })
-            
-            return faces
-        except Exception as e:
-            logger.error(f"Face detection error: {e}")
-            return []
-
-    # +++ MODIFIED: Async wrapper for new face detection +++
-    async def detect_faces(self, frame: np.ndarray) -> List[Dict[str, Any]]:
-        """Async face detection with position."""
-        return await self._run_cpu_bound_task(self._detect_faces_sync, frame)
-    
-    def _detect_voice_activity_sync(self, audio_frame: bytes) -> bool:
-        """Synchronous voice activity detection"""
-        if self.vad is None:
-            return True
-        
-        try:
-            return self.vad.is_speech(audio_frame, 16000)
-        except Exception as e:
-            logger.error(f"Voice activity detection error: {e}")
-            return True
-    
-    async def detect_voice_activity(self, audio_frame: bytes) -> bool:
-        """Async voice activity detection"""
-        return await self._run_cpu_bound_task(self._detect_voice_activity_sync, audio_frame)
-    
-    async def find_active_speaker(
-        self, 
-        frame: np.ndarray, 
-        audio_frame: Optional[bytes] = None,
-        previous_crop_center: Optional[Tuple[int, int]] = None
-    ) -> Optional[Tuple[int, int, int, int]]:
-        """Async active speaker detection"""
-        faces_with_boxes = await self.detect_faces(frame)
-        
-        # simplified return for now
-        if not faces_with_boxes:
-            return None
-
-        # Extract just the boxes for the old logic if needed, though it's mostly deprecated
-        faces = [f.get("box") for f in faces_with_boxes if f.get("box")]
-        if not faces:
-            return None
-        
-        if len(faces) == 1:
-            return faces[0]
-        
-        # Multiple faces: use heuristics
-        h, w = frame.shape[:2]
-        best_face = None
-        best_score = 0
-        
-        # Check voice activity
-        has_voice_activity = True
-        if audio_frame:
-            has_voice_activity = await self.detect_voice_activity(audio_frame)
-        
-        for face_box in faces:
-            x, y, x1, y1 = face_box
-            face_width = x1 - x
-            face_height = y1 - y
-            
-            # Score calculations
-            size_score = (face_width * face_height) / (w * h)
-            
-            face_center_x = (x + x1) / 2
-            face_center_y = (y + y1) / 2
-            center_score = 1.0 - (abs(face_center_x - w/2) / (w/2))
-            
-            # Stability score
-            stability_score = 0
-            if previous_crop_center:
-                prev_x, prev_y = previous_crop_center
-                distance = np.sqrt((face_center_x - prev_x)**2 + (face_center_y - prev_y)**2)
-                max_distance = np.sqrt(w**2 + h**2) / 3
-                stability_score = max(0, 1.0 - distance / max_distance)
-            
-            total_score = (
-                size_score * 0.35 + 
-                center_score * 0.25 + 
-                stability_score * 0.4
-            )
-            
-            if has_voice_activity:
-                total_score *= 1.15
-            
-            if total_score > best_score:
-                best_score = total_score
-                best_face = face_box
-        
-        return best_face
-    
-    def _smooth_crop_center(
-        self, 
-        new_center: Tuple[int, int], 
-        previous_crop_center: Optional[Tuple[int, int]],
-        recent_centers: List[Tuple[int, int]],
-        smoothing_config: Dict[str, Any]
-    ) -> Tuple[Tuple[int, int], List[Tuple[int, int]]]:
-        """Smooth crop center calculation"""
-        smoothing_factor = smoothing_config["smoothing_factor"]
-        max_jump_distance = smoothing_config["max_jump_distance"]
-        stability_frames = smoothing_config["stability_frames"]
-        
-        if previous_crop_center is None:
-            return new_center, [new_center]
-        
-        # Add new center to history
-        recent_centers = recent_centers.copy()
-        recent_centers.append(new_center)
-        if len(recent_centers) > stability_frames:
-            recent_centers.pop(0)
-        
-        # Calculate average
-        avg_x = sum(center[0] for center in recent_centers) / len(recent_centers)
-        avg_y = sum(center[1] for center in recent_centers) / len(recent_centers)
-        averaged_center = (int(avg_x), int(avg_y))
-        
-        prev_x, prev_y = previous_crop_center
-        new_x, new_y = averaged_center
-        
-        # Limit jump distance
-        distance = np.sqrt((new_x - prev_x)**2 + (new_y - prev_y)**2)
-        
-        if distance > max_jump_distance:
-            direction_x = (new_x - prev_x) / distance if distance > 0 else 0
-            direction_y = (new_y - prev_y) / distance if distance > 0 else 0
-            
-            new_x = prev_x + direction_x * max_jump_distance
-            new_y = prev_y + direction_y * max_jump_distance
-        
-        # Apply exponential smoothing
-        smoothed_x = int(prev_x * smoothing_factor + new_x * (1 - smoothing_factor))
-        smoothed_y = int(prev_y * smoothing_factor + new_y * (1 - smoothing_factor))
-        
-        return (smoothed_x, smoothed_y), recent_centers
-    
-    # +++ MODIFIED: Cropping logic to include torso +++
-    def _crop_frame_to_vertical(
-        self, 
-        frame: np.ndarray, 
-        speaker_box: Optional[Tuple[int, int, int, int]],
-        target_size: Tuple[int, int],
-        crop_center: Optional[Tuple[int, int]] = None,
-        padding_factor: float = 1.5, # This is now for vertical centering
-        torso_factor: float = 0.4 # How much below the face to center (0.4 = 40% of face height)
-    ) -> np.ndarray:
-        """Synchronous frame cropping, modified to better frame speaker's torso."""
-        h, w = frame.shape[:2]
-        target_width, target_height = target_size
-        target_aspect = target_width / target_height
-        
-        # Determine crop center
-        if crop_center:
-            crop_center_x, crop_center_y = crop_center
-        elif speaker_box:
-            x, y, x1, y1 = speaker_box
-            face_center_x = (x + x1) // 2
-            face_height = y1 - y
-            
-            # ** NEW: Center below the face to include the torso **
-            crop_center_y = (y + y1) // 2 + int(face_height * torso_factor)
-            crop_center_x = face_center_x
-        else:
-            crop_center_x = w // 2
-            crop_center_y = h // 2
-        
-        # Calculate crop dimensions
-        if w / h > target_aspect:
-            crop_height = h
-            crop_width = int(h * target_aspect)
-        else:
-            crop_width = w
-            crop_height = int(w / target_aspect)
-        
-        # Calculate crop boundaries
-        left = max(0, crop_center_x - crop_width // 2)
-        right = min(w, left + crop_width)
-        top = max(0, crop_center_y - crop_height // 2)
-        bottom = min(h, top + crop_height)
-        
-        # Adjust if needed
-        if right - left < crop_width:
-            if left == 0:
-                right = min(w, crop_width)
-            else:
-                left = max(0, w - crop_width)
-        
-        if bottom - top < crop_height:
-            if top == 0:
-                bottom = min(h, crop_height)
-            else:
-                top = max(0, h - crop_height)
-        
-        # Perform crop
-        cropped = frame[top:bottom, left:right]
-        
-        # Resize to target
-        if cropped.shape[:2] != (target_height, target_width):
-            cropped = cv2.resize(cropped, target_size)
-        
-        return cropped
-    
-    async def crop_frame_to_vertical(
-        self, 
-        frame: np.ndarray, 
-        speaker_box: Optional[Tuple[int, int, int, int]],
-        target_size: Tuple[int, int],
-        crop_center: Optional[Tuple[int, int]] = None
-    ) -> np.ndarray:
-        """Async frame cropping"""
-        # Note: torso_factor and padding_factor are used by the sync version, called here.
-        return await self._run_cpu_bound_task(
-            self._crop_frame_to_vertical,
-            frame, speaker_box, target_size, crop_center
-        )
-    
-    # +++ MODIFIED: Audio extraction to keep it in stereo +++
-    def _extract_audio_sync(self, video_path: Path) -> Optional[AudioSegment]:
-        """Synchronous audio extraction, keeps audio in stereo for spatial analysis."""
-        try:
-            # Check if video has an audio stream first
-            video_info = mediainfo(str(video_path))
-            has_audio_stream = False
-            if 'streams' in video_info:
-                for stream in video_info['streams']:
-                    if stream.get('codec_type') == 'audio':
-                        has_audio_stream = True
-                        break
-            
-            if not has_audio_stream:
-                 logger.warning(f"⚠️ Video {video_path.name} has no audio stream.")
-                 return None
-
-            audio = AudioSegment.from_file(str(video_path))
-            return audio
-        except Exception as e:
-            logger.error(f"Audio extraction failed: {e}")
-            return None
-    
-    # +++ MODIFIED: Async wrapper for stereo audio extraction +++
-    async def extract_audio_for_vad(self, video_path: Path) -> Optional[AudioSegment]:
-        """Async audio extraction for spatial analysis."""
-        return await self._run_cpu_bound_task(self._extract_audio_sync, video_path)
-    
-    def _process_audio_frames(self, audio_data: bytes, sample_rate: int = 16000, frame_duration_ms: int = 30):
-        """Generator for audio frame processing"""
-        if not audio_data:
-            return
-        
-        n = int(sample_rate * frame_duration_ms / 1000) * 2
-        offset = 0
-        while offset + n <= len(audio_data):
-            frame = audio_data[offset:offset + n]
-            offset += n
-            yield frame
-    
-    async def create_vertical_crop_async(
-        self, 
-        input_video_path: Path, 
+    async def create_advanced_vertical_crop(
+        self,
+        input_video_path: Path,
         output_video_path: Path,
-        use_speaker_detection: bool = True,
-        smoothing_strength: str = "very_high",
-        task_id: Optional[str] = None,
-        intelligent_speaker_tracking: bool = True # New flag
+        target_aspect_ratio: Tuple[int, int] = (9, 16),
+        task_id: Optional[str] = None
     ) -> Dict[str, Any]:
         """
-        Create vertical crop asynchronously with progress tracking
+        Create vertical crop using advanced AI techniques
         """
         if not task_id:
             task_id = self._create_task_id()
@@ -531,76 +507,53 @@ class AsyncVerticalCropService:
                 "task_id": task_id,
                 "status": "initializing",
                 "progress": 0,
-                "message": "Initializing video processing...",
+                "message": "Initializing advanced video processing...",
                 "created_at": datetime.now(),
                 "input_path": str(input_video_path),
-                "output_path": str(output_video_path),
-                "use_speaker_detection": use_speaker_detection,
-                "smoothing_strength": smoothing_strength,
-                "intelligent_speaker_tracking": intelligent_speaker_tracking
+                "output_path": str(output_video_path)
             }
         
         try:
-            # Get video properties
-            self._update_task_status(task_id, "processing", 5, "Reading video properties...")
+            # Step 1: Extract audio for speaker diarization
+            self._update_task_status(task_id, "processing", 10, "Extracting audio for speaker diarization...")
+            temp_audio_path = Path(f"temp_audio_{task_id}.wav")
+            await self._extract_audio_for_diarization(input_video_path, temp_audio_path)
             
-            cap = cv2.VideoCapture(str(input_video_path))
-            if not cap.isOpened():
-                raise Exception(f"Could not open video: {input_video_path}")
+            # Step 2: Perform speaker diarization
+            self._update_task_status(task_id, "processing", 25, "Analyzing speakers with AI...")
+            try:
+                diarization = await self.speaker_tracker.analyze_speakers(temp_audio_path)
+                if not list(diarization.itertracks()):
+                    print("⚠️ No speaker segments found, using face-detection only mode")
+            except Exception as e:
+                print(f"⚠️ Speaker diarization unavailable: {e}")
+                print("🔄 Proceeding with face-detection only mode")
+                diarization = Annotation()
             
-            original_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-            original_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-            fps = int(cap.get(cv2.CAP_PROP_FPS))
-            total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-            cap.release()
+            # Step 3: Detect scene changes
+            self._update_task_status(task_id, "processing", 40, "Detecting scene changes...")
+            scenes = await self.scene_detector.detect_scenes(input_video_path)
             
-            # Calculate target size
-            target_height = original_height
-            target_width = int(original_height * (9 / 16))
-            if target_width % 2 != 0:
-                target_width += 1
-            target_size = (target_width, target_height)
-            
-            # Configure smoothing
-            smoothing_configs = {
-                "low": {"smoothing_factor": 0.3, "max_jump_distance": 80, "stability_frames": 3},
-                "medium": {"smoothing_factor": 0.75, "max_jump_distance": 50, "stability_frames": 5},
-                "high": {"smoothing_factor": 0.9, "max_jump_distance": 25, "stability_frames": 8},
-                "very_high": {"smoothing_factor": 0.95, "max_jump_distance": 15, "stability_frames": 12}
-            }
-            
-            smoothing_config = smoothing_configs.get(smoothing_strength, smoothing_configs["medium"])
-            
-            self._update_task_status(
-                task_id, "processing", 10, 
-                f"Video: {target_size[0]}x{target_size[1]}, {fps}fps, {total_frames} frames"
+            # Step 4: Process video with advanced tracking
+            self._update_task_status(task_id, "processing", 50, "Processing video with advanced AI tracking...")
+            result = await self._process_video_advanced(
+                task_id, input_video_path, output_video_path,
+                diarization, scenes, target_aspect_ratio
             )
             
-            # Extract audio if needed
-            audio_segment = None
-            if intelligent_speaker_tracking:
-                self._update_task_status(task_id, "processing", 15, "Extracting stereo audio for analysis...")
-                audio_segment = await self.extract_audio_for_vad(input_video_path)
-            
-            # Process video
-            self._update_task_status(task_id, "processing", 20, "Starting intelligent video processing...")
-            
-            # Run the heavy video processing in a separate task
-            result = await self._process_video_frames(
-                task_id, input_video_path, output_video_path, 
-                target_size, smoothing_config, audio_segment,
-                use_speaker_detection, fps, total_frames, intelligent_speaker_tracking
-            )
+            # Cleanup
+            if temp_audio_path.exists():
+                os.remove(temp_audio_path)
             
             if result["success"]:
                 self._update_task_status(
-                    task_id, "completed", 100, 
-                    f"Video processing completed! Output: {output_video_path}",
+                    task_id, "completed", 100,
+                    f"Advanced processing completed! Output: {output_video_path}",
                     {"output_path": str(output_video_path), "file_size_mb": result.get("file_size_mb", 0)}
                 )
             else:
                 self._update_task_status(
-                    task_id, "failed", 0, 
+                    task_id, "failed", 0,
                     f"Processing failed: {result.get('error', 'Unknown error')}"
                 )
             
@@ -612,7 +565,7 @@ class AsyncVerticalCropService:
             }
             
         except Exception as e:
-            logger.error(f"❌ Async vertical crop failed for task {task_id}: {str(e)}")
+            print(f"❌ Advanced vertical crop failed for task {task_id}: {str(e)}")
             self._update_task_status(task_id, "failed", 0, f"Error: {str(e)}")
             return {
                 "success": False,
@@ -620,94 +573,128 @@ class AsyncVerticalCropService:
                 "task_id": task_id
             }
     
-    async def _process_video_frames(
+    async def _extract_audio_for_diarization(self, video_path: Path, audio_path: Path):
+        """Extract high-quality audio for speaker diarization"""
+        try:
+            # Use ffmpeg for high-quality extraction
+            cmd = [
+                'ffmpeg', '-hide_banner', '-loglevel', 'error',
+                '-i', str(video_path),
+                '-vn',  # No video
+                '-acodec', 'pcm_s16le',  # 16-bit PCM
+                '-ar', '16000',  # 16kHz sample rate
+                '-ac', '1',  # Mono
+                str(audio_path),
+                '-y'
+            ]
+            
+            process = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
+            )
+            
+            stdout, stderr = await process.communicate()
+            
+            if process.returncode != 0:
+                raise Exception(f"Audio extraction failed: {stderr.decode()}")
+                
+        except Exception as e:
+            print(f"Audio extraction error: {e}")
+            raise
+    
+    async def _process_video_advanced(
         self,
         task_id: str,
         input_video_path: Path,
         output_video_path: Path,
-        target_size: Tuple[int, int],
-        smoothing_config: Dict[str, Any],
-        audio_segment: Optional[AudioSegment],
-        use_speaker_detection: bool,
-        fps: int,
-        total_frames: int,
-        intelligent_speaker_tracking: bool
+        diarization: Annotation,
+        scenes: List[Tuple[float, float]],
+        target_aspect_ratio: Tuple[int, int]
     ) -> Dict[str, Any]:
-        """Process video frames with new intelligent speaker tracking logic."""
+        """Process video with advanced AI tracking"""
         try:
             # Setup temp video path
             temp_video_path = output_video_path.with_name(f"{output_video_path.stem}_temp_{task_id}.mp4")
             
-            # +++ NEW: Initialize transition manager +++
-            transition_manager = TransitionManager()
-
-            # Video processing state
-            previous_crop_center = None
-            recent_centers = []
-            
             # Open video
             cap = cv2.VideoCapture(str(input_video_path))
+            fps = int(cap.get(cv2.CAP_PROP_FPS))
+            total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+            original_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+            original_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+            
+            # Calculate target dimensions
+            target_width = int(original_height * target_aspect_ratio[0] / target_aspect_ratio[1])
+            target_height = original_height
+            target_size = (target_width, target_height)
+            
+            # Setup video writer
             fourcc = cv2.VideoWriter_fourcc(*'avc1')
             out = cv2.VideoWriter(str(temp_video_path), fourcc, fps, target_size)
             
+            # Initialize transition manager
+            transition_manager = AdvancedTransitionManager()
+            
+            # Processing state
             frame_count = 0
             last_progress_update = 0
+            current_scene_idx = 0
             
-            face_map = {} # To store face boxes by ID
-
+            # Smoothing state
+            previous_crop_center = None
+            recent_centers = []
+            smoothing_factor = 0.85
+            max_jump_distance = 30
+            
             while True:
                 ret, frame = cap.read()
                 if not ret:
                     break
                 
-                # Default to a wide shot if no one is speaking
-                target_speaker_box = None
-
-                if intelligent_speaker_tracking and audio_segment:
-                    # 1. Get audio chunk for the current frame
-                    frame_time_ms = (frame_count / fps) * 1000
-                    audio_chunk = audio_segment[frame_time_ms : frame_time_ms + (1000/fps)]
-
-                    # 2. Analyze spatial audio
-                    spatial_loudness = await self.analyze_spatial_audio(audio_chunk)
-
-                    # 3. Detect faces and their positions
-                    faces = await self.detect_faces(frame)
-                    face_map = {face["id"]: face["box"] for face in faces}
-
-                    # 4. Select active speaker
-                    active_speaker_id = self._select_active_speaker(faces, spatial_loudness)
-                    
-                    # 5. Get stable target from transition manager
-                    stable_speaker_id = transition_manager.get_stable_target(active_speaker_id)
-
-                    # 6. Get the speaker's bounding box
-                    if stable_speaker_id:
-                        target_speaker_box = face_map.get(stable_speaker_id)
-
-                elif use_speaker_detection: # Fallback to original method
-                    faces = await self.detect_faces(frame)
-                    if faces:
-                        target_speaker_box = faces[0]["box"]
-
-                # --- Cropping Section ---
-                # Calculate crop center with smoothing
-                if target_speaker_box:
-                    x, y, x1, y1 = target_speaker_box
+                # Calculate current timestamp
+                timestamp = frame_count / fps
+                
+                # Check for scene changes
+                if current_scene_idx < len(scenes) - 1:
+                    if timestamp >= scenes[current_scene_idx + 1][0]:
+                        current_scene_idx += 1
+                        transition_manager.reset_for_scene_change(timestamp)
+                
+                # Get active speaker from diarization
+                active_speaker = self.speaker_tracker.get_active_speaker_at_time(diarization, timestamp)
+                
+                # Detect faces in current frame
+                faces = await self.face_detector.detect_faces(frame)
+                
+                # Find face that matches active speaker
+                target_face = self._match_speaker_to_face(active_speaker, faces, timestamp)
+                
+                # Get stable target from transition manager
+                confidence = target_face.get('confidence', 0.0) if target_face else 0.0
+                stable_speaker = transition_manager.get_stable_target(
+                    active_speaker, confidence, timestamp
+                )
+                
+                # Calculate crop center
+                if target_face and stable_speaker == active_speaker:
+                    x, y, x1, y1 = target_face['box']
                     raw_center = ((x + x1) // 2, (y + y1) // 2)
                 else:
+                    # Default to center when no clear speaker
                     h, w = frame.shape[:2]
                     raw_center = (w // 2, h // 2)
                 
                 # Apply smoothing
-                crop_center, recent_centers = self._smooth_crop_center(
-                    raw_center, previous_crop_center, recent_centers, smoothing_config
+                crop_center = self._smooth_crop_center(
+                    raw_center, previous_crop_center, recent_centers,
+                    smoothing_factor, max_jump_distance
                 )
                 previous_crop_center = crop_center
                 
                 # Crop frame
-                cropped_frame = await self.crop_frame_to_vertical(
-                    frame, target_speaker_box, target_size, crop_center
+                cropped_frame = self._crop_frame_to_target_ratio(
+                    frame, target_size, crop_center
                 )
                 
                 # Write frame
@@ -715,24 +702,21 @@ class AsyncVerticalCropService:
                 
                 frame_count += 1
                 
-                # Update progress (every 2 seconds to avoid spam)
+                # Update progress
                 if frame_count - last_progress_update >= (fps * 2):
-                    progress = 20 + int((frame_count / total_frames) * 60)  # 20-80% for video processing
+                    progress = 50 + int((frame_count / total_frames) * 35)  # 50-85%
                     self._update_task_status(
                         task_id, "processing", progress,
-                        f"Processing frames: {frame_count}/{total_frames} ({progress-20:.1f}%)"
+                        f"Processing frames: {frame_count}/{total_frames} ({progress-50:.1f}%)"
                     )
                     last_progress_update = frame_count
-                    
-                    # Yield control to allow other tasks to run
-                    await asyncio.sleep(0)
+                    await asyncio.sleep(0)  # Yield control
             
             cap.release()
             out.release()
             
             # Add audio back
-            self._update_task_status(task_id, "processing", 85, "Adding audio to video...")
-            
+            self._update_task_status(task_id, "processing", 90, "Adding audio to video...")
             success = await self._add_audio_to_video(temp_video_path, input_video_path, output_video_path)
             
             # Calculate file size
@@ -751,16 +735,112 @@ class AsyncVerticalCropService:
             }
             
         except Exception as e:
-            logger.error(f"Video processing error for task {task_id}: {e}")
+            print(f"Advanced video processing error for task {task_id}: {e}")
             return {"success": False, "error": str(e)}
     
-    async def _add_audio_to_video(
+    def _match_speaker_to_face(
         self, 
-        temp_video_path: Path, 
-        input_video_path: Path, 
+        active_speaker: Optional[str], 
+        faces: List[Dict[str, Any]], 
+        timestamp: float
+    ) -> Optional[Dict[str, Any]]:
+        """Match active speaker to detected face"""
+        if not active_speaker or not faces:
+            return None
+        
+        # Simple heuristic: return highest confidence face
+        # In production, you might use speaker embedding matching
+        if faces:
+            return max(faces, key=lambda f: f.get('confidence', 0))
+        
+        return None
+    
+    def _smooth_crop_center(
+        self,
+        new_center: Tuple[int, int],
+        previous_center: Optional[Tuple[int, int]],
+        recent_centers: List[Tuple[int, int]],
+        smoothing_factor: float,
+        max_jump_distance: int
+    ) -> Tuple[int, int]:
+        """Apply smoothing to crop center"""
+        if previous_center is None:
+            return new_center
+        
+        # Add to history
+        recent_centers.append(new_center)
+        if len(recent_centers) > 8:
+            recent_centers.pop(0)
+        
+        # Calculate average
+        avg_x = sum(c[0] for c in recent_centers) / len(recent_centers)
+        avg_y = sum(c[1] for c in recent_centers) / len(recent_centers)
+        averaged_center = (int(avg_x), int(avg_y))
+        
+        prev_x, prev_y = previous_center
+        new_x, new_y = averaged_center
+        
+        # Limit jump distance
+        distance = np.sqrt((new_x - prev_x)**2 + (new_y - prev_y)**2)
+        if distance > max_jump_distance:
+            direction_x = (new_x - prev_x) / distance if distance > 0 else 0
+            direction_y = (new_y - prev_y) / distance if distance > 0 else 0
+            new_x = prev_x + direction_x * max_jump_distance
+            new_y = prev_y + direction_y * max_jump_distance
+        
+        # Apply exponential smoothing
+        smoothed_x = int(prev_x * smoothing_factor + new_x * (1 - smoothing_factor))
+        smoothed_y = int(prev_y * smoothing_factor + new_y * (1 - smoothing_factor))
+        
+        return (smoothed_x, smoothed_y)
+    
+    def _crop_frame_to_target_ratio(
+        self,
+        frame: np.ndarray,
+        target_size: Tuple[int, int],
+        crop_center: Tuple[int, int]
+    ) -> np.ndarray:
+        """Crop frame to target aspect ratio centered on specific point"""
+        h, w = frame.shape[:2]
+        target_width, target_height = target_size
+        
+        crop_center_x, crop_center_y = crop_center
+        
+        # Calculate crop boundaries
+        left = max(0, crop_center_x - target_width // 2)
+        right = min(w, left + target_width)
+        top = max(0, crop_center_y - target_height // 2)
+        bottom = min(h, top + target_height)
+        
+        # Adjust if hitting boundaries
+        if right - left < target_width:
+            if left == 0:
+                right = min(w, target_width)
+            else:
+                left = max(0, w - target_width)
+        
+        if bottom - top < target_height:
+            if top == 0:
+                bottom = min(h, target_height)
+            else:
+                top = max(0, h - target_height)
+        
+        # Perform crop
+        cropped = frame[top:bottom, left:right]
+        
+        # Resize if needed
+        if cropped.shape[:2] != (target_height, target_width):
+            cropped = cv2.resize(cropped, target_size)
+        
+        return cropped
+    
+    async def _add_audio_to_video(
+        self,
+        temp_video_path: Path,
+        input_video_path: Path,
         output_video_path: Path
     ) -> bool:
-        """Add audio to video using ffmpeg (async)"""
+        """Add audio to video using ffmpeg"""
         try:
             # Check if original has audio
             with VideoFileClip(str(input_video_path)) as original_clip:
@@ -778,7 +858,6 @@ class AsyncVerticalCropService:
                 '-shortest', str(output_video_path), '-y'
             ]
             
-            # Run ffmpeg asynchronously
             process = await asyncio.create_subprocess_exec(
                 *cmd,
                 stdout=asyncio.subprocess.PIPE,
@@ -790,75 +869,226 @@ class AsyncVerticalCropService:
             if process.returncode == 0:
                 return True
             else:
-                logger.error(f"ffmpeg error: {stderr.decode()}")
-                # Fallback: rename temp file
+                print(f"ffmpeg error: {stderr.decode()}")
                 if temp_video_path.exists():
                     temp_video_path.rename(output_video_path)
                 return False
                 
         except Exception as e:
-            logger.error(f"Audio merge error: {e}")
+            print(f"Audio merge error: {e}")
             if temp_video_path.exists():
                 temp_video_path.rename(output_video_path)
             return False
+    
+    async def get_task_status(self, task_id: str) -> Optional[Dict[str, Any]]:
+        """Get task status by ID"""
+        with self.task_lock:
+            return self.active_tasks.get(task_id, None)
+    
+    async def list_active_tasks(self) -> Dict[str, Dict[str, Any]]:
+        """List all active tasks"""
+        with self.task_lock:
+            return self.active_tasks.copy()
 
-    # +++ NEW: The "Decision Engine" to select the speaker +++
-    def _select_active_speaker(
+
+# Basic Async Vertical Crop Service (for backward compatibility)
+class AsyncVerticalCropService:
+    """Basic async vertical crop service for backward compatibility"""
+    
+    def __init__(self, max_workers: int = 4, max_concurrent_tasks: int = 10):
+        self.max_workers = max_workers
+        self.max_concurrent_tasks = max_concurrent_tasks
+        self.thread_executor = ThreadPoolExecutor(max_workers=max_workers)
+        self.active_tasks: Dict[str, Dict[str, Any]] = {}
+        self.task_lock = threading.Lock()
+        print(f"🚀 AsyncVerticalCropService initialized with {max_workers} workers")
+    
+    def _create_task_id(self) -> str:
+        """Generate unique task ID"""
+        return f"crop_{uuid.uuid4().hex[:8]}"
+    
+    def _update_task_status(self, task_id: str, status: str, progress: int = 0, message: str = "", data: Optional[Dict] = None):
+        """Thread-safe task status update"""
+        with self.task_lock:
+            if task_id in self.active_tasks:
+                self.active_tasks[task_id].update({
+                    "status": status,
+                    "progress": progress,
+                    "message": message,
+                    "updated_at": datetime.now()
+                })
+                if data:
+                    self.active_tasks[task_id].update(data)
+    
+    async def create_vertical_crop_async(
         self,
-        faces: List[Dict[str, Any]],
-        spatial_loudness: Dict[str, float],
-        loudness_threshold: float = 100.0  # Min RMS to be considered speech
-    ) -> Optional[str]:
-        """
-        Selects the most likely active speaker by correlating face position with audio channel loudness.
-        Returns the unique ID of the winning face.
-        """
-        speaker_scores = {}
-        for face in faces:
-            position = face["position"]
-            loudness = spatial_loudness.get(position, 0)
+        input_path: Path,
+        output_path: Path,
+        use_speaker_detection: bool = True,
+        smoothing_strength: str = "very_high"
+    ) -> Dict[str, Any]:
+        """Create vertical crop asynchronously"""
+        task_id = self._create_task_id()
+        
+        # Initialize task tracking
+        with self.task_lock:
+            self.active_tasks[task_id] = {
+                "task_id": task_id,
+                "status": "queued",
+                "progress": 0,
+                "message": "Processing queued",
+                "created_at": datetime.now(),
+                "input_path": str(input_path),
+                "output_path": str(output_path)
+            }
+        
+        # Start processing in background
+        asyncio.create_task(self._process_vertical_crop(
+            task_id, input_path, output_path, use_speaker_detection, smoothing_strength
+        ))
+        
+        return {"task_id": task_id, "status": "queued"}
+    
+    async def _process_vertical_crop(
+        self,
+        task_id: str,
+        input_path: Path,
+        output_path: Path,
+        use_speaker_detection: bool,
+        smoothing_strength: str
+    ):
+        """Process vertical crop in background"""
+        try:
+            self._update_task_status(task_id, "processing", 10, "Starting vertical crop processing...")
             
-            # Only consider faces in channels with significant sound
-            if loudness > loudness_threshold:
-                speaker_scores[face["id"]] = loudness
+            # Import the basic vertical crop function
+            from app.services.vertical_crop import crop_video_to_vertical
+            
+            # Run in thread executor
+            loop = asyncio.get_event_loop()
+            success = await loop.run_in_executor(
+                self.thread_executor,
+                crop_video_to_vertical,
+                input_path,
+                output_path,
+                use_speaker_detection,
+                smoothing_strength
+            )
+            
+            if success:
+                file_size_mb = 0
+                if output_path.exists():
+                    file_size_mb = output_path.stat().st_size / (1024 * 1024)
+                
+                self._update_task_status(
+                    task_id, "completed", 100,
+                    f"Vertical crop completed successfully",
+                    {
+                        "output_path": str(output_path),
+                        "file_size_mb": round(file_size_mb, 2),
+                        "completed_at": datetime.now()
+                    }
+                )
+            else:
+                self._update_task_status(task_id, "failed", 0, "Vertical crop processing failed")
+                
+        except Exception as e:
+            self._update_task_status(task_id, "failed", 0, f"Error: {str(e)}")
+    
+    async def get_task_status(self, task_id: str) -> Optional[Dict[str, Any]]:
+        """Get task status by ID"""
+        with self.task_lock:
+            return self.active_tasks.get(task_id, None)
+    
+    async def list_active_tasks(self) -> Dict[str, Dict[str, Any]]:
+        """List all active tasks"""
+        with self.task_lock:
+            return self.active_tasks.copy()
+    
+    async def cleanup_completed_tasks(self, max_age_hours: int = 24):
+        """Clean up old completed tasks"""
+        current_time = datetime.now()
+        to_remove = []
+        
+        with self.task_lock:
+            for task_id, task in self.active_tasks.items():
+                if task["status"] in ["completed", "failed"]:
+                    completed_at = task.get("completed_at", task.get("created_at"))
+                    if completed_at and (current_time - completed_at).total_seconds() > max_age_hours * 3600:
+                        to_remove.append(task_id)
+            
+            for task_id in to_remove:
+                del self.active_tasks[task_id]
 
-        if not speaker_scores:
-            return None
 
-        # Return the ID of the face with the loudest corresponding channel
-        return max(speaker_scores, key=speaker_scores.get)
-
-# Global async service instance
+# Global service instances
+advanced_vertical_crop_service = None
 async_vertical_crop_service = AsyncVerticalCropService()
 
-# Convenience functions
+def initialize_advanced_service(hf_token: Optional[str] = None):
+    """Initialize the advanced service with HuggingFace token (from env if not provided)"""
+    global advanced_vertical_crop_service
+    token = hf_token or os.getenv('HF_TOKEN')
+    if token:
+        print(f"🔧 Initializing global advanced service with HF token: {token[:10]}...")
+    else:
+        print("🔧 Initializing global advanced service without HF token (face-detection only)")
+    advanced_vertical_crop_service = AdvancedVerticalCropService(token)
+    print(f"✅ Advanced service initialized successfully")
+
+# Backward compatibility functions
 async def crop_video_to_vertical_async(
     input_path: Path,
     output_path: Path,
     use_speaker_detection: bool = True,
-    smoothing_strength: str = "very_high",
-    task_id: Optional[str] = None,
-    intelligent_speaker_tracking: bool = True # Add new flag
+    smoothing_strength: str = "very_high"
 ) -> Dict[str, Any]:
-    """
-    Async convenience function to crop video to vertical format
-    
-    Returns:
-        Dict with success, task_id, output_path, error keys
-    """
+    """Async vertical crop for backward compatibility"""
     return await async_vertical_crop_service.create_vertical_crop_async(
-        input_path, output_path, use_speaker_detection, smoothing_strength, task_id,
-        intelligent_speaker_tracking=intelligent_speaker_tracking
+        input_path, output_path, use_speaker_detection, smoothing_strength
     )
 
 async def get_crop_task_status(task_id: str) -> Optional[Dict[str, Any]]:
-    """Get status of a cropping task"""
+    """Get crop task status for backward compatibility"""
     return await async_vertical_crop_service.get_task_status(task_id)
 
 async def list_crop_tasks() -> Dict[str, Dict[str, Any]]:
-    """List all active cropping tasks"""
+    """List crop tasks for backward compatibility"""
     return await async_vertical_crop_service.list_active_tasks()
 
 async def cleanup_old_crop_tasks(max_age_hours: int = 24):
-    """Clean up old completed tasks"""
-    await async_vertical_crop_service.cleanup_completed_tasks(max_age_hours) 
+    """Cleanup old crop tasks for backward compatibility"""
+    await async_vertical_crop_service.cleanup_completed_tasks(max_age_hours)
+
+# Advanced functions
+async def crop_video_advanced(
+    input_path: Path,
+    output_path: Path,
+    target_aspect_ratio: Tuple[int, int] = (9, 16),
+    task_id: Optional[str] = None,
+    hf_token: Optional[str] = None
+) -> Dict[str, Any]:
+    """
+    Advanced video cropping with AI speaker tracking
+    HF token will be loaded from environment variables if not provided
+    """
+    global advanced_vertical_crop_service
+    
+    # Initialize service if not already done or if a specific token is provided
+    if not advanced_vertical_crop_service or hf_token:
+        token = hf_token or os.getenv('HF_TOKEN')
+        if token:
+            print(f"🔧 Initializing advanced service with HF token: {token[:10]}...")
+        else:
+            print("🔧 Initializing advanced service without HF token (face-detection only)")
+        advanced_vertical_crop_service = AdvancedVerticalCropService(token)
+    
+    return await advanced_vertical_crop_service.create_advanced_vertical_crop(
+        input_path, output_path, target_aspect_ratio, task_id
+    )
+
+async def get_advanced_crop_task_status(task_id: str) -> Optional[Dict[str, Any]]:
+    """Get status of an advanced cropping task"""
+    if not advanced_vertical_crop_service:
+        return None
+    return await advanced_vertical_crop_service.get_task_status(task_id)
