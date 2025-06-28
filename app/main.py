@@ -12,6 +12,11 @@ from pathlib import Path
 
 # Import routers
 from app.routers import workflow
+try:
+    from app.routers import crop
+    CROP_AVAILABLE = True
+except ImportError:
+    CROP_AVAILABLE = False
 
 # Create FastAPI app
 app = FastAPI(
@@ -33,6 +38,10 @@ app.add_middleware(
 
 # Include routers
 app.include_router(workflow.router, prefix="/workflow", tags=["workflow"])
+
+# Include crop router if available
+if CROP_AVAILABLE:
+    app.include_router(crop.router, prefix="/crop", tags=["Video Cropping"])
 
 # Root endpoint
 @app.get("/")

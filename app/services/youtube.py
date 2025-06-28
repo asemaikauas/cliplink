@@ -7,14 +7,9 @@ from typing import List, Dict, Optional
 from moviepy import VideoFileClip
 import asyncio
 
-# Import vertical cropping service
-try:
-    from .vertical_crop import crop_video_to_vertical
-    VERTICAL_CROP_AVAILABLE = True
-    print("✅ Vertical cropping service loaded")
-except ImportError as e:
-    VERTICAL_CROP_AVAILABLE = False
-    print(f"⚠️ Vertical cropping not available: {e}")
+# Intelligent cropping service removed
+INTELLIGENT_CROP_AVAILABLE = False
+VERTICAL_CROP_AVAILABLE = False
 
 # Configure MoviePy to use the system ffmpeg if available
 try:
@@ -536,90 +531,7 @@ def cut_clips(video_path: Path, analysis: Dict) -> List[Path]:
     return created_clips
 
 
-def cut_clips_vertical(video_path: Path, analysis: Dict, smoothing_strength: str = "very_high") -> List[Path]:
-    """
-    Cuts a video into vertical clips based on analysis, with motion smoothing.
-
-    Args:
-        video_path: Path to the source video file.
-        analysis: Dictionary containing viral segments from Gemini.
-        smoothing_strength: Motion smoothing level.
-    
-    Returns:
-        A list of paths to the created vertical clips.
-    """
-    if not VERTICAL_CROP_AVAILABLE:
-        print("❌ Vertical cropping service not available, cannot create vertical clips")
-        return []
-    
-    video_path = Path(video_path)
-    if not video_path.exists():
-        print(f"❌ Video file not found: {video_path}")
-        return []
-    
-    viral_segments = analysis.get("gemini_analysis", {}).get("viral_segments", [])
-    if not viral_segments:
-        print("❌ No viral segments found in analysis")
-        return []
-        
-    clips_dir = Path("clips") / "vertical"
-    clips_dir.mkdir(parents=True, exist_ok=True)
-    
-    created_clips = []
-    
-    print(f"\n📱 Creating {len(viral_segments)} vertical clips...")
-    
-    for i, segment in enumerate(viral_segments):
-        start_time = segment.get("start")
-        end_time = segment.get("end")
-        
-        if start_time is None or end_time is None:
-            continue
-
-        base_name = _sanitize_filename(segment.get("title", f"segment_{i+1}"))
-        
-        # Create a temporary horizontal clip first
-        temp_horizontal_clip_path = clips_dir / f"temp_{base_name}.mp4"
-        
-        try:
-            print(f"  ➡️  Step 1/2: Cutting horizontal segment: '{base_name}' ({start_time}-{end_time})")
-            
-            # Use direct ffmpeg for robust cutting
-            success = create_clip_with_direct_ffmpeg(
-                video_path, start_time, end_time, temp_horizontal_clip_path
-            )
-
-            if not success or not temp_horizontal_clip_path.exists():
-                print(f"      ❌ Failed to cut horizontal segment")
-                continue
-
-            # Now, create vertical crop from the temporary clip
-            vertical_clip_path = clips_dir / f"{base_name}_vertical.mp4"
-            print(f"  🔄  Step 2/2: Converting to vertical format...")
-
-            crop_success = crop_video_to_vertical(
-                input_path=temp_horizontal_clip_path,
-                output_path=vertical_clip_path,
-                use_speaker_detection=True,
-                smoothing_strength=smoothing_strength
-            )
-
-            if crop_success:
-                print(f"      ✅ Vertical clip created: {vertical_clip_path.name}")
-                created_clips.append(vertical_clip_path)
-            else:
-                print(f"      ❌ Failed to create vertical crop for '{base_name}'")
-
-        except Exception as e:
-            print(f"  ❌ Error processing segment '{base_name}': {e}")
-        
-        finally:
-            # Clean up the temporary horizontal clip
-            if temp_horizontal_clip_path.exists():
-                os.remove(temp_horizontal_clip_path)
-
-    print(f"\n✅ Vertical clip creation complete: {len(created_clips)} clips created.")
-    return created_clips
+# Vertical cropping function removed
 
 
 def check_video_quality(video_path: Path) -> Dict:
@@ -708,116 +620,4 @@ def _sanitize_filename(filename: str) -> str:
     
     return filename 
 
-async def cut_clips_vertical_async(video_path: Path, analysis: Dict, smoothing_strength: str = "very_high") -> List[Path]:
-    """
-    Async version of cut_clips_vertical that uses the AsyncVerticalCropService for concurrent processing.
-    
-    Args:
-        video_path: Path to the source video file.
-        analysis: Dictionary containing viral segments from Gemini.
-        smoothing_strength: Motion smoothing level.
-    
-    Returns:
-        A list of paths to the created vertical clips.
-    """
-    from app.services.vertical_crop_async import async_vertical_crop_service
-    
-    # Create output directory for clips
-    clips_dir = Path("clips")
-    clips_dir.mkdir(parents=True, exist_ok=True)
-    
-    # Extract viral segments
-    gemini_analysis = analysis.get("gemini_analysis", {})
-    viral_segments = gemini_analysis.get("viral_segments", [])
-    
-    if not viral_segments:
-        logging.warning("No viral segments found in analysis")
-        return []
-    
-    if not video_path.exists():
-        raise FileNotFoundError(f"Video file not found: {video_path}")
-    
-    print(f"✂️ 🔥 Создаю {len(viral_segments)} вертикальных клипов АСИНХРОННО из {video_path.name}")
-    
-    # First, cut the horizontal clips
-    horizontal_clips = cut_clips(video_path, analysis)
-    
-    if not horizontal_clips:
-        print("❌ Не удалось создать горизонтальные клипы")
-        return []
-    
-    print(f"📹 Создано {len(horizontal_clips)} горизонтальных клипов, теперь делаю их вертикальными...")
-    
-    # Start async vertical cropping tasks for all clips
-    crop_tasks = []
-    vertical_clip_paths = []
-    
-    for i, horizontal_clip_path in enumerate(horizontal_clips):
-        if not horizontal_clip_path.exists():
-            print(f"⚠️ Горизонтальный клип не найден: {horizontal_clip_path}")
-            continue
-        
-        # Generate vertical clip path
-        vertical_clip_path = clips_dir / f"{horizontal_clip_path.stem}_vertical.mp4"
-        vertical_clip_paths.append(vertical_clip_path)
-        
-        print(f"🚀 Запускаю вертикальную обрезку {i+1}/{len(horizontal_clips)}: {horizontal_clip_path.name}")
-        
-        # Start async vertical crop task
-        task = async_vertical_crop_service.create_vertical_crop_async(
-            input_video_path=horizontal_clip_path,
-            output_video_path=vertical_clip_path,
-            use_speaker_detection=True,
-            smoothing_strength=smoothing_strength
-        )
-        crop_tasks.append(task)
-    
-    if not crop_tasks:
-        print("❌ Не удалось запустить задачи вертикальной обрезки")
-        return []
-    
-    print(f"⏳ Ожидаю завершения {len(crop_tasks)} задач вертикальной обрезки...")
-    
-    # Wait for all crop tasks to complete
-    try:
-        results = await asyncio.gather(*crop_tasks, return_exceptions=True)
-        
-        successful_clips = []
-        failed_clips = 0
-        
-        for i, result in enumerate(results):
-            if isinstance(result, Exception):
-                print(f"❌ Ошибка при обрезке клипа {i+1}: {str(result)}")
-                failed_clips += 1
-            elif isinstance(result, dict) and result.get("success"):
-                output_path = Path(result["output_path"])
-                if output_path.exists():
-                    successful_clips.append(output_path)
-                    print(f"✅ Вертикальный клип создан: {output_path.name}")
-                else:
-                    print(f"⚠️ Клип успешно обработан, но файл не найден: {output_path}")
-                    failed_clips += 1
-            else:
-                print(f"❌ Неудачная обрезка клипа {i+1}: {result.get('error', 'Unknown error')}")
-                failed_clips += 1
-        
-        print(f"\n🎉 РЕЗУЛЬТАТ ВЕРТИКАЛЬНОЙ НАРЕЗКИ:")
-        print(f"✅ Создано вертикальных клипов: {len(successful_clips)}")
-        print(f"❌ Неудачных обрезок: {failed_clips}")
-        print(f"📊 Итого: {len(successful_clips)}/{len(crop_tasks)}")
-        
-        # Clean up horizontal clips (optional)
-        print(f"🧹 Очищаю промежуточные горизонтальные клипы...")
-        for horizontal_clip in horizontal_clips:
-            try:
-                if horizontal_clip.exists():
-                    horizontal_clip.unlink()
-                    print(f"  🗑️ Удален: {horizontal_clip.name}")
-            except Exception as e:
-                print(f"  ⚠️ Не удалось удалить {horizontal_clip.name}: {e}")
-        
-        return successful_clips
-        
-    except Exception as e:
-        print(f"❌ Критическая ошибка при асинхронной обрезке: {str(e)}")
-        return [] 
+# Async vertical cropping function removed 
