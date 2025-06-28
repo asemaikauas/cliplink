@@ -38,6 +38,12 @@ ENV/
 env/
 .env/
 
+/venv_py312
+/venv_py313
+
+/venv_py312/bin
+/venv_py312/lib/python3.12/site-packages
+
 # PyCharm
 .idea/
 

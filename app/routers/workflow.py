@@ -612,17 +612,23 @@ class VerticalCropRequest(BaseModel):
     smoothing_strength: Optional[str] = "very_high"  # low, medium, high, very_high
 
 class AsyncVerticalCropRequest(BaseModel):
-    """Request for async vertical crop processing"""
+    """Request for async vertical crop processing with smart scene detection"""
     video_path: str
     output_path: Optional[str] = None
     use_speaker_detection: Optional[bool] = True
+    use_smart_scene_detection: Optional[bool] = True
+    scene_content_threshold: Optional[float] = 30.0
+    scene_fade_threshold: Optional[float] = 8.0
+    scene_min_length: Optional[int] = 15
+    ignore_micro_cuts: Optional[bool] = True
+    micro_cut_threshold: Optional[int] = 10
     smoothing_strength: Optional[str] = "very_high"
     priority: Optional[str] = "normal"  # low, normal, high
 
 @router.post("/create-vertical-crop-async")
 async def create_vertical_crop_async(request: AsyncVerticalCropRequest):
     """
-    Create vertical crop asynchronously with progress tracking
+    Create vertical crop asynchronously with smart scene detection and progress tracking
     Returns immediately with task_id for status polling
     """
     try:
@@ -636,18 +642,31 @@ async def create_vertical_crop_async(request: AsyncVerticalCropRequest):
         else:
             output_dir = Path("temp_vertical") / "clips"
             output_dir.mkdir(parents=True, exist_ok=True)
-            output_path = output_dir / f"{input_path.stem}_vertical.mp4"
+            smart_suffix = "_smart" if request.use_smart_scene_detection else "_legacy"
+            output_path = output_dir / f"{input_path.stem}_vertical{smart_suffix}.mp4"
         
-        print(f"🚀 Starting async vertical crop: {input_path.name}")
+        print(f"🚀 Starting smart async vertical crop: {input_path.name}")
         print(f"📱 Output: {output_path}")
         print(f"🎛️ Smoothing: {request.smoothing_strength}")
         print(f"🔊 Speaker detection: {request.use_speaker_detection}")
+        print(f"🎬 Smart scene detection: {request.use_smart_scene_detection}")
+        if request.use_smart_scene_detection:
+            print(f"   📊 Content threshold: {request.scene_content_threshold}")
+            print(f"   🌅 Fade threshold: {request.scene_fade_threshold}")
+            print(f"   ⏱️ Min scene length: {request.scene_min_length}")
+            print(f"   🔍 Ignore micro-cuts: {request.ignore_micro_cuts} (< {request.micro_cut_threshold} frames)")
         
-        # Start async processing
+        # Start smart async processing
         result = await crop_video_to_vertical_async(
             input_path=input_path,
             output_path=output_path,
             use_speaker_detection=request.use_speaker_detection,
+            use_smart_scene_detection=request.use_smart_scene_detection,
+            scene_content_threshold=request.scene_content_threshold,
+            scene_fade_threshold=request.scene_fade_threshold,
+            scene_min_length=request.scene_min_length,
+            ignore_micro_cuts=request.ignore_micro_cuts,
+            micro_cut_threshold=request.micro_cut_threshold,
             smoothing_strength=request.smoothing_strength
         )
         task_id = result["task_id"]
@@ -655,15 +674,23 @@ async def create_vertical_crop_async(request: AsyncVerticalCropRequest):
         return {
             "success": True,
             "task_id": task_id,
-            "message": "Vertical crop processing started",
+            "message": "Smart vertical crop processing started with PySceneDetect",
             "input_path": str(input_path),
             "output_path": str(output_path),
+            "smart_features": {
+                "scene_detection_enabled": request.use_smart_scene_detection,
+                "speaker_detection_enabled": request.use_speaker_detection,
+                "scene_content_threshold": request.scene_content_threshold,
+                "scene_fade_threshold": request.scene_fade_threshold,
+                "micro_cut_filtering": request.ignore_micro_cuts,
+                "smoothing_strength": request.smoothing_strength
+            },
             "status_endpoint": f"/workflow/task-status/{task_id}",
-            "estimated_time": "2-10 minutes depending on video length"
+            "estimated_time": "2-10 minutes depending on video length and scene complexity"
         }
         
     except Exception as e:
-        print(f"❌ Async vertical crop failed: {str(e)}")
+        print(f"❌ Smart async vertical crop failed: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Failed to start processing: {str(e)}")
 
 @router.get("/task-status/{task_id}")
@@ -802,11 +829,166 @@ async def create_vertical_crop(request: VerticalCropRequest, async_processing: b
 async def test_upload_vertical(
     file: UploadFile = File(...),
     use_speaker_detection: bool = True,
+    use_smart_scene_detection: bool = True,
+    enable_group_conversation_framing: bool = False,
+    scene_content_threshold: float = 30.0,
+    scene_fade_threshold: float = 8.0,
+    scene_min_length: int = 15,
+    ignore_micro_cuts: bool = True,
+    micro_cut_threshold: int = 10,
+    smoothing_strength: str = "very_high",
+    async_processing: bool = True
+):
+    """
+    Test endpoint for uploading a video and creating a smart vertical crop with scene detection.
+    
+    This demonstrates the NEW intelligent scene-aware cropping system where PySceneDetect
+    acts as the "brain" telling your smoothing when to reset for perfect responsiveness
+    on every real cut while maintaining smooth tracking in stable scenes.
+    
+    Args:
+        file: Video file to upload and process
+        use_speaker_detection: Whether to use speaker detection for smart cropping
+        use_smart_scene_detection: Whether to use smart scene detection for crop resets
+        enable_group_conversation_framing: Enable split-screen layout for 2-speaker conversations (top/bottom)
+        scene_content_threshold: Sensitivity for hard cuts (higher = less sensitive, 30.0 = default)
+        scene_fade_threshold: Sensitivity for gradual transitions/fades (8.0 = default)
+        scene_min_length: Minimum scene length in frames to avoid micro-cuts (15 = default)
+        ignore_micro_cuts: Whether to ignore very short scenes (True = recommended)
+        micro_cut_threshold: Threshold for micro-cut detection in frames (10 = default)
+        smoothing_strength: Motion smoothing level ("very_high" = most stable)
+        async_processing: Whether to use async processing (True = recommended for better performance)
+    """
+    try:
+        # Create a temporary file to save the upload
+        with tempfile.NamedTemporaryFile(delete=False, suffix=Path(file.filename).suffix, dir=TEMP_UPLOADS_DIR) as tmp:
+            shutil.copyfileobj(file.file, tmp)
+            temp_path = Path(tmp.name)
+        
+        print(f"📄 Uploaded file saved to temporary path: {temp_path}")
+        print(f"📁 File size: {temp_path.stat().st_size / (1024*1024):.2f} MB")
+
+        # Define the output path for the smart cropped video
+        output_dir = Path("temp_vertical")
+        output_dir.mkdir(exist_ok=True)
+        
+        # Include scene detection info in filename for clarity
+        scene_suffix = "_smart" if use_smart_scene_detection else "_legacy"
+        output_path = output_dir / f"{temp_path.stem}_vertical{scene_suffix}_{smoothing_strength}.mp4"
+        
+        print(f"🎬 Starting SMART vertical crop process...")
+        print(f"   🔊 Speaker detection: {use_speaker_detection}")
+        print(f"   🎬 Smart scene detection: {use_smart_scene_detection}")
+        if use_smart_scene_detection:
+            print(f"   📊 Scene content threshold: {scene_content_threshold}")
+            print(f"   🌅 Scene fade threshold: {scene_fade_threshold}")
+            print(f"   ⏱️ Min scene length: {scene_min_length} frames")
+            print(f"   🔍 Ignore micro-cuts: {ignore_micro_cuts} (< {micro_cut_threshold} frames)")
+        print(f"   🎛️ Smoothing: {smoothing_strength}")
+        print(f"   ⚡ Async processing: {async_processing}")
+
+        if async_processing:
+            # Use the NEW smart async processing system
+            result = await crop_video_to_vertical_async(
+                input_path=temp_path,
+                output_path=output_path,
+                use_speaker_detection=use_speaker_detection,
+                use_smart_scene_detection=use_smart_scene_detection,
+                enable_group_conversation_framing=enable_group_conversation_framing,
+                scene_content_threshold=scene_content_threshold,
+                scene_fade_threshold=scene_fade_threshold,
+                scene_min_length=scene_min_length,
+                ignore_micro_cuts=ignore_micro_cuts,
+                micro_cut_threshold=micro_cut_threshold,
+                smoothing_strength=smoothing_strength
+            )
+            
+            task_id = result["task_id"]
+            
+            print(f"🚀 Smart vertical crop started with task ID: {task_id}")
+            
+            # Clean up temp file (the async process has its own copy)
+            if temp_path.exists():
+                os.remove(temp_path)
+            
+            return {
+                "success": True,
+                "processing_type": "smart_async",
+                "task_id": task_id,
+                "message": "Smart vertical crop processing started with PySceneDetect",
+                "uploaded_file": file.filename,
+                "output_path": str(output_path),
+                "smart_features": {
+                    "scene_detection_enabled": use_smart_scene_detection,
+                    "speaker_detection_enabled": use_speaker_detection,
+                    "group_conversation_framing_enabled": enable_group_conversation_framing,
+                    "scene_content_threshold": scene_content_threshold,
+                    "scene_fade_threshold": scene_fade_threshold,
+                    "micro_cut_filtering": ignore_micro_cuts,
+                    "smoothing_strength": smoothing_strength
+                },
+                "status_endpoint": f"/workflow/task-status/{task_id}",
+                "download_endpoint": f"/workflow/download-result/{task_id}",
+                "estimated_processing_time": "2-10 minutes depending on video length and scene complexity",
+                "scene_detection_info": "Video will be pre-analyzed for scene boundaries before processing",
+                "expected_results": {
+                    "scenes_detected": "Will be available in status after scene analysis",
+                    "smart_resets": "Number of intelligent crop resets at scene cuts",
+                    "cut_boundaries": "Frame numbers where scene changes occur"
+                }
+            }
+        
+        else:
+            # Fallback to synchronous processing (legacy mode)
+            print("⚠️ Using legacy synchronous processing - consider using async_processing=True")
+            
+            # Import the old synchronous function for backward compatibility
+            from app.services.vertical_crop import crop_video_to_vertical as crop_sync
+            
+            success = crop_sync(
+                input_path=temp_path,
+                output_path=output_path,
+                use_speaker_detection=use_speaker_detection,
+                smoothing_strength=smoothing_strength
+            )
+
+            if not success:
+                # Clean up the temp file even on failure
+                os.remove(temp_path)
+                raise HTTPException(status_code=500, detail="Vertical cropping failed during processing")
+
+            print(f"✅ Legacy vertical crop successful! Output at: {output_path}")
+            
+            # Clean up temp file
+            if temp_path.exists():
+                os.remove(temp_path)
+            
+            # Return a downloadable link to the file (legacy mode)
+            return FileResponse(
+                path=output_path, 
+                media_type='video/mp4', 
+                filename=output_path.name
+            )
+
+    except HTTPException:
+        # Re-raise HTTP exceptions to return proper status codes
+        raise
+    except Exception as e:
+        print(f"❌ An error occurred during smart vertical crop test: {e}")
+        # Clean up temp file on any other exception
+        if 'temp_path' in locals() and temp_path.exists():
+            os.remove(temp_path)
+        raise HTTPException(status_code=500, detail=f"An unexpected error occurred: {str(e)}")
+
+@router.post("/test-upload-vertical-legacy")
+async def test_upload_vertical_legacy(
+    file: UploadFile = File(...),
+    use_speaker_detection: bool = True,
     smoothing_strength: str = "very_high"
 ):
     """
-    Test endpoint for uploading a video and creating a vertical crop from it.
-    This demonstrates the vertical cropping functionality on any video file.
+    LEGACY test endpoint for uploading a video and creating a vertical crop (old system).
+    Use /test-upload-vertical with async_processing=True for the new smart scene detection system.
     """
     try:
         # Create a temporary file to save the upload
@@ -819,14 +1001,16 @@ async def test_upload_vertical(
         # Define the output path for the cropped video
         output_dir = Path("temp_vertical")
         output_dir.mkdir(exist_ok=True)
-        output_path = output_dir / f"{temp_path.stem}_vertical_{smoothing_strength}.mp4"
+        output_path = output_dir / f"{temp_path.stem}_vertical_legacy_{smoothing_strength}.mp4"
         
-        print(f"🚀 Starting vertical crop process...")
+        print(f"🚀 Starting LEGACY vertical crop process...")
         print(f"   - Speaker detection: {use_speaker_detection}")
         print(f"   - Smoothing: {smoothing_strength}")
 
-        # Call the vertical cropping service
-        success = crop_video_to_vertical(
+        # Call the OLD vertical cropping service
+        from app.services.vertical_crop import crop_video_to_vertical as crop_sync
+        
+        success = crop_sync(
             input_path=temp_path,
             output_path=output_path,
             use_speaker_detection=use_speaker_detection,
@@ -838,7 +1022,11 @@ async def test_upload_vertical(
             os.remove(temp_path)
             raise HTTPException(status_code=500, detail="Vertical cropping failed during processing")
 
-        print(f"✅ Vertical crop successful! Output at: {output_path}")
+        print(f"✅ Legacy vertical crop successful! Output at: {output_path}")
+        
+        # Clean up temp file
+        if temp_path.exists():
+            os.remove(temp_path)
         
         # Return a downloadable link to the file
         return FileResponse(
@@ -851,7 +1039,7 @@ async def test_upload_vertical(
         # Re-raise HTTP exceptions to return proper status codes
         raise
     except Exception as e:
-        print(f"❌ An error occurred during vertical crop test: {e}")
+        print(f"❌ An error occurred during legacy vertical crop test: {e}")
         # Clean up temp file on any other exception
         if 'temp_path' in locals() and temp_path.exists():
             os.remove(temp_path)

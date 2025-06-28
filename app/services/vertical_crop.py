@@ -534,7 +534,7 @@ def crop_video_to_vertical(
             - "low": Минимальное сглаживание (быстрая реакция, factor=0.3, jump=80px)
             - "medium": Среднее сглаживание (баланс, factor=0.75, jump=50px) 
             - "high": Максимальное сглаживание (очень плавно, factor=0.9, jump=25px)
-            - "very_high": Экстремальное сглаживание (максимально плавно, factor=0.95, jump=15px)
+            - "very_high": Экстремальное сглаживание (максимально плавно, factor=0.95, jump=30px)
     """
     return vertical_crop_service.create_vertical_crop(
         input_path, 
