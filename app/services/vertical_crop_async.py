@@ -353,7 +353,8 @@ class AsyncVerticalCropService:
             crop_center_x = face_center_x
             crop_center_y = max(face_center_y - padding_y, face_center_y)
         else:
-            crop_center_x = w // 2
+            # 🔧 FALLBACK: Use right side instead of center when no speaker or crop center specified
+            crop_center_x = int(w * 0.75)  # 75% to the right
             crop_center_y = h // 2
         
         # Calculate crop dimensions
@@ -772,9 +773,9 @@ class AsyncVerticalCropService:
                     # 🔧 SIMPLE FIX: Don't jump to center, preserve previous position to avoid twitches
                     h, w = frame.shape[:2]
                     if previous_crop_center is None:
-                        # Only use center if we have no previous position
-                        previous_crop_center = (w // 2, h // 2)
-                        recent_centers = [(w // 2, h // 2)]
+                        # 🔧 CONSISTENT FALLBACK: Use right side when no previous position (same as single-speaker fallback)
+                        previous_crop_center = (int(w * 0.75), h // 2)
+                        recent_centers = [(int(w * 0.75), h // 2)]
                     # Otherwise keep the existing previous_crop_center to avoid jarring jumps
                     
                 else:
@@ -786,8 +787,9 @@ class AsyncVerticalCropService:
                         x, y, x1, y1 = speaker_box
                         raw_center = ((x + x1) // 2, (y + y1) // 2)
                     else:
+                        # 🔧 FALLBACK: Use right side instead of center when no person detected
                         h, w = frame.shape[:2]
-                        raw_center = (w // 2, h // 2)
+                        raw_center = (int(w * 0.75), h // 2)  # 75% to the right, vertically centered
                     
                     # Apply smoothing logic based on reset state
                     if should_reset:
