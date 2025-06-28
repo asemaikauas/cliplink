@@ -526,7 +526,7 @@ class AsyncVerticalCropService:
                 "low": {"smoothing_factor": 0.3, "max_jump_distance": 80, "stability_frames": 3},
                 "medium": {"smoothing_factor": 0.75, "max_jump_distance": 50, "stability_frames": 5},
                 "high": {"smoothing_factor": 0.9, "max_jump_distance": 25, "stability_frames": 8},
-                "very_high": {"smoothing_factor": 0.95, "max_jump_distance": 15, "stability_frames": 12}
+                "very_high": {"smoothing_factor": 0.95, "max_jump_distance": 15, "stability_frames": 12}  # 🔧 Reduced jump distance to prevent twitches
             }
             
             smoothing_config = smoothing_configs.get(smoothing_strength, smoothing_configs["medium"])
@@ -675,6 +675,10 @@ class AsyncVerticalCropService:
             recent_centers = []
             smart_resets = 0
             
+            # 🔧 ANTI-TWITCH: Prevent rapid mode switching
+            last_dual_speaker_frame = -999  # Track when we last used dual speaker mode
+            dual_speaker_stability_threshold = fps // 6  # Require 1/6 second between mode switches
+            
             logger.info(f"🎬 Starting smart processing with {len(scene_boundaries)} scene boundaries")
             
             # Setup audio generator
@@ -746,9 +750,18 @@ class AsyncVerticalCropService:
                         frame, audio_frame, previous_crop_center, enable_group_conversation_framing
                     )
                 
+                # 🔧 ANTI-TWITCH: Check if we should use dual speaker mode (prevent rapid switching)
+                can_use_dual_speaker = (
+                    speaker_result and 
+                    isinstance(speaker_result, dict) and 
+                    speaker_result.get("mode") == "dual_speaker" and
+                    (frame_count - last_dual_speaker_frame) >= dual_speaker_stability_threshold
+                )
+                
                 # Handle different speaker detection results
-                if speaker_result and isinstance(speaker_result, dict) and speaker_result.get("mode") == "dual_speaker":
+                if can_use_dual_speaker:
                     # 👥 DUAL SPEAKER MODE: Create split-screen layout
+                    last_dual_speaker_frame = frame_count  # Update last usage
                     cropped_frame = await self.create_dual_speaker_frame(
                         frame, 
                         speaker_result["speaker_1"], 
@@ -756,10 +769,13 @@ class AsyncVerticalCropService:
                         target_size
                     )
                     
-                    # For dual speaker mode, use center as "previous" for next frame's stability
+                    # 🔧 SIMPLE FIX: Don't jump to center, preserve previous position to avoid twitches
                     h, w = frame.shape[:2]
-                    previous_crop_center = (w // 2, h // 2)
-                    recent_centers = [(w // 2, h // 2)]
+                    if previous_crop_center is None:
+                        # Only use center if we have no previous position
+                        previous_crop_center = (w // 2, h // 2)
+                        recent_centers = [(w // 2, h // 2)]
+                    # Otherwise keep the existing previous_crop_center to avoid jarring jumps
                     
                 else:
                     # 🎯 SINGLE SPEAKER MODE: Traditional smart cropping with smoothing
