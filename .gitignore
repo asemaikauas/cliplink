@@ -197,3 +197,10 @@ ehthumbs.db
 Thumbs.db 
 
 downloads/
+
+
+Dockerfile/
+
+docker-compose.yml 
+
+tests/

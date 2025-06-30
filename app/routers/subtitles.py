@@ -1,0 +1,342 @@
+"""FastAPI router for subtitle processing endpoints."""
+
+import os
+import uuid
+import logging
+import time
+import shutil
+from typing import Optional
+from pathlib import Path
+
+from fastapi import APIRouter, HTTPException, BackgroundTasks, UploadFile, File, Form
+from fastapi.responses import FileResponse
+from pydantic import BaseModel, Field
+
+from app.services.groq_client import transcribe
+from app.services.subs import convert_groq_to_subtitles
+from app.services.burn_in import burn_subtitles_to_video
+from app.exceptions import SubtitleError, TranscriptionError, SubtitleFormatError, BurnInError
+
+
+logger = logging.getLogger(__name__)
+
+router = APIRouter()
+
+
+class SubtitleResponse(BaseModel):
+    """Response model for subtitle processing."""
+    task_id: str = Field(..., description="Unique task identifier")
+    srt_path: str = Field(..., description="Path to the generated SRT file")
+    vtt_path: str = Field(..., description="Path to the generated VTT file")
+    burned_video_path: Optional[str] = Field(None, description="Path to video with burned-in subtitles")
+    language: str = Field(..., description="Detected language code")
+    cost_usd: float = Field(..., description="Estimated transcription cost in USD")
+    latency_ms: int = Field(..., description="Total processing latency in milliseconds")
+    original_filename: str = Field(..., description="Original uploaded filename")
+    file_size_mb: float = Field(..., description="Uploaded file size in MB")
+
+
+def _log_stage(task_id: str, stage: str, elapsed_ms: int) -> None:
+    """Log structured stage information."""
+    logger.info(f"task_id={task_id} stage={stage} elapsed_ms={elapsed_ms}")
+
+
+def _cleanup_files(*file_paths: str) -> None:
+    """Clean up temporary files."""
+    for file_path in file_paths:
+        try:
+            if file_path and os.path.exists(file_path):
+                os.remove(file_path)
+                logger.debug(f"Cleaned up file: {file_path}")
+        except Exception as e:
+            logger.warning(f"Failed to cleanup file {file_path}: {e}")
+
+
+@router.post("/subtitles", response_model=SubtitleResponse)
+async def create_subtitles(
+    video_file: UploadFile = File(..., description="Video file to process"),
+    burn_in: bool = Form(True, description="Whether to burn subtitles into video"),
+    font_size_pct: float = Form(4.5, ge=1.0, le=10.0, description="Font size as percentage of video height"),
+    export_codec: str = Form("h264", description="Video codec for output (h264, h265, etc.)"),
+    disable_vad: bool = Form(False, description="Disable VAD filtering (may help with continuous speech)"),
+    background_tasks: BackgroundTasks = None
+) -> SubtitleResponse:
+    """Create subtitles for an uploaded video file.
+    
+    Upload a video file and get back:
+    1. Transcription using Groq Whisper large-v3
+    2. Generated SRT and VTT subtitle files
+    3. Optionally, a video with burned-in subtitles
+    
+    Args:
+        video_file: Uploaded video file (MP4, MOV, AVI, etc.)
+        burn_in: Whether to burn subtitles into the video
+        font_size_pct: Font size as percentage of video height
+        export_codec: Video codec for output
+        disable_vad: Disable VAD filtering (may help with continuous speech)
+        background_tasks: FastAPI background tasks
+        
+    Returns:
+        Subtitle processing response with file paths and metadata
+        
+    Raises:
+        HTTPException: If processing fails
+    """
+    task_id = str(uuid.uuid4())
+    start_time = time.time()
+    
+    # Track files for cleanup
+    temp_video_path = None
+    srt_path = None
+    vtt_path = None
+    burned_video_path = None
+    
+    try:
+        logger.info(f"🎬 Starting subtitle processing (task_id: {task_id})")
+        logger.info(f"📁 Uploaded file: {video_file.filename} ({video_file.content_type})")
+        logger.info(f"⚙️ Settings: VAD={'disabled' if disable_vad else 'enabled'}, burn_in={burn_in}")
+        
+        # Validate file type
+        if not video_file.content_type or not video_file.content_type.startswith('video/'):
+            raise HTTPException(
+                status_code=400,
+                detail=f"Invalid file type: {video_file.content_type}. Please upload a video file."
+            )
+        
+        # Calculate file size
+        file_size_mb = 0
+        if hasattr(video_file, 'size') and video_file.size:
+            file_size_mb = video_file.size / (1024 * 1024)
+        
+        # Create temporary directory for this task
+        temp_dir = Path("temp_uploads") / task_id
+        temp_dir.mkdir(parents=True, exist_ok=True)
+        
+        # Save uploaded file
+        file_extension = Path(video_file.filename).suffix or '.mp4'
+        temp_video_path = str(temp_dir / f"input{file_extension}")
+        
+        _log_stage(task_id, "file_upload_start", 0)
+        
+        with open(temp_video_path, "wb") as buffer:
+            shutil.copyfileobj(video_file.file, buffer)
+        
+        upload_elapsed = int((time.time() - start_time) * 1000)
+        _log_stage(task_id, "file_upload_complete", upload_elapsed)
+        
+        # Verify file was saved correctly
+        if not os.path.exists(temp_video_path) or os.path.getsize(temp_video_path) == 0:
+            raise HTTPException(
+                status_code=400,
+                detail="Failed to save uploaded file or file is empty"
+            )
+        
+        # If file size wasn't available from upload, calculate it now
+        if file_size_mb == 0:
+            file_size_mb = os.path.getsize(temp_video_path) / (1024 * 1024)
+        
+        logger.info(f"📊 File saved: {temp_video_path} ({file_size_mb:.2f} MB)")
+        
+        # Create output directory for subtitles
+        output_dir = temp_dir / "output"
+        output_dir.mkdir(exist_ok=True)
+        
+        filename_base = Path(video_file.filename).stem or f"video_{task_id[:8]}"
+        
+        # Stage 1: Transcription
+        stage_start = time.time()
+        _log_stage(task_id, "transcription_start", upload_elapsed)
+        
+        logger.info(f"🎤 Starting transcription with Groq Whisper large-v3...")
+        transcription_result = transcribe(
+            file_path=temp_video_path,
+            apply_vad=not disable_vad,  # Invert the disable flag
+            task_id=task_id
+        )
+        
+        # If we got no segments and VAD was enabled, try again without VAD
+        if len(transcription_result["segments"]) == 0 and not disable_vad:
+            logger.info(f"🔄 No segments found with VAD, retrying without VAD filtering...")
+            transcription_result = transcribe(
+                file_path=temp_video_path,
+                apply_vad=False,
+                task_id=f"{task_id}_retry"
+            )
+        
+        stage_elapsed = int((time.time() - stage_start) * 1000)
+        _log_stage(task_id, "transcription_complete", stage_elapsed)
+        
+        logger.info(f"✅ Transcription complete: {len(transcription_result['segments'])} segments, language: {transcription_result['language']}")
+        
+        # Stage 2: Subtitle generation
+        stage_start = time.time()
+        _log_stage(task_id, "subtitle_generation_start", stage_elapsed)
+        
+        logger.info(f"📝 Generating SRT and VTT subtitle files...")
+        srt_path, vtt_path = convert_groq_to_subtitles(
+            groq_segments=transcription_result["segments"],
+            output_dir=str(output_dir),
+            filename_base=filename_base
+        )
+        
+        stage_elapsed = int((time.time() - stage_start) * 1000)
+        _log_stage(task_id, "subtitle_generation_complete", stage_elapsed)
+        
+        logger.info(f"✅ Subtitle files created: {Path(srt_path).name}, {Path(vtt_path).name}")
+        
+        # Stage 3: Burn-in (if requested)
+        if burn_in:
+            stage_start = time.time()
+            _log_stage(task_id, "burn_in_start", stage_elapsed)
+            
+            burned_video_path = str(output_dir / f"{filename_base}_subtitled.mp4")
+            
+            logger.info(f"🔥 Burning subtitles into video...")
+            burned_video_path = burn_subtitles_to_video(
+                video_path=temp_video_path,
+                srt_path=srt_path,
+                output_path=burned_video_path,
+                font_size_pct=font_size_pct,
+                export_codec=export_codec,
+                task_id=task_id
+            )
+            
+            stage_elapsed = int((time.time() - stage_start) * 1000)
+            _log_stage(task_id, "burn_in_complete", stage_elapsed)
+            
+            logger.info(f"✅ Burned-in video created: {Path(burned_video_path).name}")
+        else:
+            logger.info("⏭️ Skipping subtitle burn-in (burn_in=false)")
+        
+        # Calculate total latency
+        total_latency_ms = int((time.time() - start_time) * 1000)
+        
+        # Schedule cleanup of temporary input video (keep outputs for download)
+        if background_tasks:
+            background_tasks.add_task(_cleanup_files, temp_video_path)
+        
+        response = SubtitleResponse(
+            task_id=task_id,
+            srt_path=srt_path,
+            vtt_path=vtt_path,
+            burned_video_path=burned_video_path,
+            language=transcription_result["language"],
+            cost_usd=transcription_result["cost_usd"],
+            latency_ms=total_latency_ms,
+            original_filename=video_file.filename,
+            file_size_mb=round(file_size_mb, 2)
+        )
+        
+        logger.info(f"🎉 Subtitle processing completed (task_id: {task_id}) - {total_latency_ms}ms")
+        logger.info(f"📊 Final stats: {len(transcription_result['segments'])} segments, "
+                   f"${transcription_result['cost_usd']:.4f} cost, {response.file_size_mb}MB processed")
+        
+        return response
+        
+    except TranscriptionError as e:
+        logger.error(f"Transcription error (task_id: {task_id}): {e.message}")
+        _cleanup_files(temp_video_path, srt_path, vtt_path, burned_video_path)
+        raise HTTPException(status_code=500, detail=f"Transcription failed: {e.message}")
+    
+    except SubtitleFormatError as e:
+        logger.error(f"Subtitle format error (task_id: {task_id}): {e.message}")
+        _cleanup_files(temp_video_path, srt_path, vtt_path, burned_video_path)
+        raise HTTPException(status_code=500, detail=f"Subtitle generation failed: {e.message}")
+    
+    except BurnInError as e:
+        logger.error(f"Burn-in error (task_id: {task_id}): {e.message}")
+        _cleanup_files(temp_video_path, srt_path, vtt_path, burned_video_path)
+        raise HTTPException(status_code=500, detail=f"Subtitle burn-in failed: {e.message}")
+    
+    except SubtitleError as e:
+        logger.error(f"Subtitle error (task_id: {task_id}): {e.message}")
+        _cleanup_files(temp_video_path, srt_path, vtt_path, burned_video_path)
+        raise HTTPException(status_code=500, detail=f"Subtitle processing failed: {e.message}")
+    
+    except Exception as e:
+        logger.error(f"Unexpected error (task_id: {task_id}): {str(e)}")
+        _cleanup_files(temp_video_path, srt_path, vtt_path, burned_video_path)
+        raise HTTPException(status_code=500, detail="Internal server error")
+
+
+@router.get("/subtitles/download/{file_type}/{task_id}/{filename}")
+async def download_subtitle_file(
+    file_type: str,
+    task_id: str, 
+    filename: str
+):
+    """Download generated subtitle or video files.
+    
+    Args:
+        file_type: Type of file (srt, vtt, video)
+        task_id: Task ID from subtitle processing
+        filename: Name of the file to download
+        
+    Returns:
+        File download response
+    """
+    try:
+        # Construct file path
+        base_dir = Path("temp_uploads") / task_id / "output"
+        file_path = base_dir / filename
+        
+        if not file_path.exists():
+            raise HTTPException(status_code=404, detail="File not found")
+        
+        # Determine media type
+        media_type_map = {
+            'srt': 'text/plain',
+            'vtt': 'text/vtt',
+            'video': 'video/mp4'
+        }
+        
+        media_type = media_type_map.get(file_type, 'application/octet-stream')
+        
+        return FileResponse(
+            path=str(file_path),
+            media_type=media_type,
+            filename=filename
+        )
+        
+    except Exception as e:
+        logger.error(f"Download error: {str(e)}")
+        raise HTTPException(status_code=500, detail="Download failed")
+
+
+@router.get("/subtitles/health")
+async def health_check():
+    """Health check endpoint for subtitle service."""
+    try:
+        # Basic import test
+        from app.services.groq_client import GroqClient
+        from app.services.burn_in import BurnInRenderer
+        
+        # Test Groq API key
+        groq_key = os.getenv("GROQ_API_KEY")
+        groq_available = bool(groq_key)
+        
+        # Test FFmpeg availability
+        try:
+            renderer = BurnInRenderer()
+            ffmpeg_available = True
+        except Exception:
+            ffmpeg_available = False
+        
+        # Check temp directory
+        temp_dir = Path("temp_uploads")
+        temp_dir.mkdir(exist_ok=True)
+        temp_writable = os.access(temp_dir, os.W_OK)
+        
+        return {
+            "status": "healthy",
+            "service": "subtitle_processor",
+            "groq_api_available": groq_available,
+            "ffmpeg_available": ffmpeg_available,
+            "temp_directory_writable": temp_writable,
+            "temp_directory": str(temp_dir.absolute())
+        }
+    except Exception as e:
+        raise HTTPException(
+            status_code=503,
+            detail=f"Service unhealthy: {str(e)}"
+        ) 

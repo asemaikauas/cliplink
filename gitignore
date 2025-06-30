@@ -236,3 +236,5 @@ secrets.json
 *.dump
 *.core
 core.*
+
+tests/
