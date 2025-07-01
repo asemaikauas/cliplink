@@ -58,7 +58,7 @@ async def create_subtitles(
     burn_in: bool = Form(True, description="Whether to burn subtitles into video"),
     font_size_pct: float = Form(4.5, ge=1.0, le=10.0, description="Font size as percentage of video height"),
     export_codec: str = Form("h264", description="Video codec for output (h264, h265, etc.)"),
-    disable_vad: bool = Form(False, description="Disable VAD filtering (may help with continuous speech)"),
+    disable_vad: bool = Form(True, description="Disable VAD filtering (enabled by default for better performance)"),
     background_tasks: BackgroundTasks = None
 ) -> SubtitleResponse:
     """Create subtitles for an uploaded video file.
@@ -162,6 +162,18 @@ async def create_subtitles(
                 apply_vad=False,
                 task_id=f"{task_id}_retry"
             )
+        # If we got very few segments and VAD was enabled, also retry without VAD
+        elif len(transcription_result["segments"]) < 3 and not disable_vad:
+            logger.info(f"🔄 Very few segments found with VAD ({len(transcription_result['segments'])}), retrying without VAD filtering...")
+            retry_result = transcribe(
+                file_path=temp_video_path,
+                apply_vad=False,
+                task_id=f"{task_id}_retry_few"
+            )
+            # Use the result with more segments
+            if len(retry_result["segments"]) > len(transcription_result["segments"]):
+                logger.info(f"✅ Better result without VAD: {len(retry_result['segments'])} vs {len(transcription_result['segments'])} segments")
+                transcription_result = retry_result
         
         stage_elapsed = int((time.time() - stage_start) * 1000)
         _log_stage(task_id, "transcription_complete", stage_elapsed)

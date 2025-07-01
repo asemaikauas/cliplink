@@ -2,6 +2,7 @@
 
 import re
 import logging
+import sys
 from typing import List, Dict, Any, Tuple
 from dataclasses import dataclass
 from pathlib import Path
@@ -147,11 +148,29 @@ class SubtitleProcessor:
         
         return f"{hours:02d}:{minutes:02d}:{secs:02d}.{millisecs:03d}"
     
+    def _format_time_simple(self, seconds: float) -> str:
+        """Format time in a simple readable format (MM:SS).
+        
+        Args:
+            seconds: Time in seconds
+            
+        Returns:
+            Formatted time string (MM:SS or HH:MM:SS)
+        """
+        hours = int(seconds // 3600)
+        minutes = int((seconds % 3600) // 60)
+        secs = int(seconds % 60)
+        
+        if hours > 0:
+            return f"{hours:02d}:{minutes:02d}:{secs:02d}"
+        else:
+            return f"{minutes:02d}:{secs:02d}"
+    
     def _groq_segments_to_subtitle_segments(self, groq_segments: List[Any]) -> List[SubtitleSegment]:
         """Convert Groq transcription segments to subtitle segments.
         
         Args:
-            groq_segments: Groq transcription segments
+            groq_segments: Groq transcription segments (can be dicts or objects)
             
         Returns:
             List of subtitle segments
@@ -159,14 +178,24 @@ class SubtitleProcessor:
         subtitle_segments = []
         
         for segment in groq_segments:
-            # Clean up text
-            text = segment.text.strip()
+            # Handle both dictionary and object formats
+            if isinstance(segment, dict):
+                # Dictionary format: {'text': '...', 'start': 0.0, 'end': 3.5}
+                text = segment.get('text', '').strip()
+                start_time = segment.get('start', 0.0)
+                end_time = segment.get('end', 0.0)
+            else:
+                # Object format: segment.text, segment.start, segment.end
+                text = getattr(segment, 'text', '').strip()
+                start_time = getattr(segment, 'start', 0.0)
+                end_time = getattr(segment, 'end', 0.0)
+            
             if not text:
                 continue
             
             subtitle_segments.append(SubtitleSegment(
-                start_time=segment.start,
-                end_time=segment.end,
+                start_time=start_time,
+                end_time=end_time,
                 text=text
             ))
         
@@ -202,10 +231,44 @@ class SubtitleProcessor:
                     ))
             
             logger.info(f"Final processed segments: {len(final_segments)}")
+            
+            # Print subtitles to console
+            self._print_subtitles_to_console(final_segments)
+            
             return final_segments
             
         except Exception as e:
             raise SubtitleFormatError(f"Failed to process segments: {str(e)}")
+    
+    def _print_subtitles_to_console(self, segments: List[SubtitleSegment]) -> None:
+        """Print formatted subtitles to console.
+        
+        Args:
+            segments: List of subtitle segments to print
+        """
+        if not segments:
+            print("\n⚠️  No subtitle segments to display\n")
+            sys.stdout.flush()
+            return
+        
+        print("\n" + "="*80)
+        print(f"📝 GENERATED SUBTITLES ({len(segments)} segments)")
+        print("="*80)
+        
+        for i, segment in enumerate(segments, 1):
+            start_time = self._format_time_simple(segment.start_time)
+            end_time = self._format_time_simple(segment.end_time)
+            duration = segment.end_time - segment.start_time
+            
+            print(f"\n[{i:3d}] {start_time} --> {end_time} ({duration:.1f}s)")
+            
+            # Handle multi-line text
+            lines = segment.text.split('\n')
+            for line in lines:
+                print(f"      {line}")
+        
+        print("\n" + "="*80 + "\n")
+        sys.stdout.flush()
     
     def generate_srt(self, segments: List[SubtitleSegment]) -> str:
         """Generate SRT subtitle content.

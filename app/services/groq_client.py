@@ -39,15 +39,15 @@ class GroqClient:
     def _apply_vad_filtering(
         self, 
         audio_path: str, 
-        silence_threshold: int = -45,
-        min_silence_duration: int = 3000
+        silence_threshold: int = None,
+        min_silence_duration: int = None
     ) -> str:
         """Apply Voice Activity Detection to remove silent stretches.
         
         Args:
             audio_path: Path to input audio file
-            silence_threshold: Silence threshold in dB (default: -45 dB)
-            min_silence_duration: Minimum silence duration in ms (default: 3000 ms)
+            silence_threshold: Silence threshold in dB (default from env or -55 dB)
+            min_silence_duration: Minimum silence duration in ms (default from env or 5000 ms)
             
         Returns:
             Path to processed audio file with silence removed
@@ -56,7 +56,13 @@ class GroqClient:
             VADError: If VAD processing fails
         """
         try:
-            logger.info(f"Applying VAD filtering to {audio_path}")
+            # Use environment variables for defaults if not provided
+            if silence_threshold is None:
+                silence_threshold = int(os.getenv("VAD_SILENCE_THRESHOLD", -55))
+            if min_silence_duration is None:
+                min_silence_duration = int(os.getenv("VAD_MIN_SILENCE_DURATION", 5000))
+                
+            logger.info(f"Applying VAD filtering to {audio_path} (threshold: {silence_threshold}dB, min_duration: {min_silence_duration}ms)")
             
             # Load audio
             audio = AudioSegment.from_file(audio_path)
@@ -76,9 +82,8 @@ class GroqClient:
                 audio = audio[:start] + audio[end:]
             
             # Export processed audio
-            output_path = audio_path.replace(".wav", "_vad_filtered.wav")
-            if output_path == audio_path:  # If not a .wav file, add suffix
-                output_path = f"{audio_path}_vad_filtered.wav"
+            audio_path_obj = Path(audio_path)
+            output_path = str(audio_path_obj.parent / f"{audio_path_obj.stem}_vad_filtered.wav")
             
             audio.export(output_path, format="wav")
             
@@ -91,7 +96,7 @@ class GroqClient:
     def transcribe(
         self,
         file_path: str,
-        apply_vad: bool = True,
+        apply_vad: bool = False,
         language: Optional[str] = None,
         task_id: Optional[str] = None
     ) -> Dict[str, Any]:
@@ -129,7 +134,7 @@ class GroqClient:
                     file=audio_file,
                     model=self.model,
                     response_format="verbose_json",
-                    timestamp_granularities=["word"],
+                    timestamp_granularities=["segment", "word"],  # Ask for both segments and words
                     language=language
                 )
             
@@ -142,7 +147,11 @@ class GroqClient:
             print(f"   Language: {getattr(transcription, 'language', 'NO_LANGUAGE')}")
             if hasattr(transcription, 'segments') and transcription.segments:
                 print(f"   Segments count: {len(transcription.segments)}")
-                print(f"   First segment: {transcription.segments[0] if transcription.segments else 'NO_SEGMENTS'}")
+                print(f"   First segment type: {type(transcription.segments[0])}")
+                print(f"   First segment content: {transcription.segments[0] if transcription.segments else 'NO_SEGMENTS'}")
+                if transcription.segments and isinstance(transcription.segments[0], dict):
+                    print(f"   First segment keys: {list(transcription.segments[0].keys())}")
+            print() # Empty line for readability
             
             # Validate the transcription response
             if not hasattr(transcription, 'segments'):
@@ -163,14 +172,31 @@ class GroqClient:
             latency_ms = int((time.time() - start_time) * 1000)
             
             # Estimate cost (Groq pricing: ~$0.111 per hour of audio)
-            file_size_mb = os.path.getsize(processed_file_path) / (1024 * 1024)
-            estimated_duration_hours = file_size_mb / 10  # Rough estimate
-            cost_usd = estimated_duration_hours * 0.111
+            # Use actual audio duration for more accurate cost estimation
+            try:
+                from pydub import AudioSegment
+                audio_segment = AudioSegment.from_file(processed_file_path)
+                duration_hours = audio_segment.duration_seconds / 3600
+                cost_usd = duration_hours * 0.111
+            except Exception:
+                # Fallback to file size estimation if audio loading fails
+                file_size_mb = os.path.getsize(processed_file_path) / (1024 * 1024)
+                estimated_duration_hours = file_size_mb / 10  # Rough estimate
+                cost_usd = estimated_duration_hours * 0.111
             
             # Print transcribed text to console
             full_text = ""
             if segments:
-                full_text = " ".join([segment.text.strip() for segment in segments if hasattr(segment, 'text')])
+                # Handle both dictionary and object formats
+                text_parts = []
+                for segment in segments:
+                    if isinstance(segment, dict):
+                        text = segment.get('text', '').strip()
+                    else:
+                        text = getattr(segment, 'text', '').strip()
+                    if text:
+                        text_parts.append(text)
+                full_text = " ".join(text_parts)
             elif hasattr(transcription, 'text') and transcription.text:
                 full_text = transcription.text
             
@@ -243,7 +269,7 @@ class GroqClient:
 
 def transcribe(
     file_path: str,
-    apply_vad: bool = True,
+    apply_vad: bool = False,
     language: Optional[str] = None,
     task_id: Optional[str] = None
 ) -> Dict[str, Any]:
