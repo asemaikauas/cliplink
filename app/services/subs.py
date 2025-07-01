@@ -30,20 +30,32 @@ class SubtitleProcessor:
     
     def __init__(
         self,
-        max_chars_per_line: int = 50,  # Increased from 42 for less aggressive wrapping
-        max_lines: int = 2,
-        merge_gap_threshold_ms: int = 200
+        max_chars_per_line: int = 50,  # Legacy parameter - not used in CapCut mode
+        max_lines: int = 2,  # Legacy parameter - not used in CapCut mode  
+        merge_gap_threshold_ms: int = 200,
+        capcut_mode: bool = True,  # Enable CapCut-style punch words
+        min_word_duration_ms: int = 600,  # Minimum display time per word chunk
+        max_word_duration_ms: int = 1200,  # Maximum display time per word chunk
+        word_overlap_ms: int = 200  # Overlap between word chunks for smooth flow
     ):
         """Initialize subtitle processor.
         
         Args:
-            max_chars_per_line: Maximum characters per subtitle line
-            max_lines: Maximum number of lines per subtitle
+            max_chars_per_line: Maximum characters per subtitle line (legacy)
+            max_lines: Maximum number of lines per subtitle (legacy)
             merge_gap_threshold_ms: Merge segments with gaps smaller than this (ms)
+            capcut_mode: Enable CapCut-style 1-3 word punch subtitles
+            min_word_duration_ms: Minimum display time per word chunk (ms)
+            max_word_duration_ms: Maximum display time per word chunk (ms)  
+            word_overlap_ms: Overlap between word chunks for smooth transitions (ms)
         """
         self.max_chars_per_line = max_chars_per_line
         self.max_lines = max_lines
         self.merge_gap_threshold_ms = merge_gap_threshold_ms
+        self.capcut_mode = capcut_mode
+        self.min_word_duration_ms = min_word_duration_ms
+        self.max_word_duration_ms = max_word_duration_ms
+        self.word_overlap_ms = word_overlap_ms
     
     def _merge_micro_gaps(self, segments: List[SubtitleSegment]) -> List[SubtitleSegment]:
         """Merge segments with micro-gaps smaller than threshold.
@@ -124,6 +136,108 @@ class SubtitleProcessor:
         
         return lines, remaining_text
     
+    def _create_capcut_word_chunks(self, text: str, start_time: float, end_time: float) -> List[SubtitleSegment]:
+        """Create CapCut-style word chunks with millisecond precision timing.
+        
+        Args:
+            text: Text to chunk into punch words
+            start_time: Original segment start time (seconds)
+            end_time: Original segment end time (seconds)
+            
+        Returns:
+            List of word chunk segments with overlapping timing
+        """
+        words = text.split()
+        if not words:
+            return []
+        
+        duration_s = end_time - start_time
+        duration_ms = duration_s * 1000
+        
+        # Create 1-3 word chunks with smarter grouping
+        chunks = []
+        i = 0
+        while i < len(words):
+            remaining_words = len(words) - i
+            
+            # Smart chunk size selection
+            if remaining_words >= 5:
+                # Prefer 3-word chunks when we have plenty of words
+                chunk_size = 3
+            elif remaining_words == 4:
+                # Split 4 words into 2+2
+                chunk_size = 2
+            elif remaining_words == 3:
+                # Keep 3 words together
+                chunk_size = 3
+            elif remaining_words == 2:
+                # Keep 2 words together
+                chunk_size = 2
+            else:
+                # Single word
+                chunk_size = 1
+            
+            chunk_words = words[i:i+chunk_size]
+            chunk_text = " ".join(chunk_words)
+            chunks.append(chunk_text)
+            i += chunk_size
+        
+        if not chunks:
+            return []
+        
+        logger.debug(f"CapCut chunking: '{text}' -> {len(chunks)} chunks: {chunks}")
+        
+        # Calculate timing for each chunk
+        segments = []
+        overlap_s = self.word_overlap_ms / 1000.0
+        min_duration_s = self.min_word_duration_ms / 1000.0
+        max_duration_s = self.max_word_duration_ms / 1000.0
+        
+        # Calculate base duration per chunk
+        if len(chunks) == 1:
+            # Single chunk gets full duration
+            chunk_duration = min(max_duration_s, duration_s)
+            chunk_start = start_time
+            chunk_end = start_time + chunk_duration
+        else:
+            # Multiple chunks with overlap
+            # Total time available for chunks (including overlaps)
+            total_available_time = duration_s + (len(chunks) - 1) * overlap_s
+            base_duration_per_chunk = total_available_time / len(chunks)
+            
+            # Ensure duration is within bounds
+            base_duration_per_chunk = max(min_duration_s, min(max_duration_s, base_duration_per_chunk))
+            
+            current_start = start_time
+            for i, chunk_text in enumerate(chunks):
+                chunk_start = current_start
+                chunk_end = chunk_start + base_duration_per_chunk
+                
+                # Ensure last chunk doesn't exceed original end time by too much
+                if i == len(chunks) - 1:
+                    chunk_end = min(chunk_end, end_time + 0.5)  # Allow 500ms overshoot for last chunk
+                
+                segments.append(SubtitleSegment(
+                    start_time=chunk_start,
+                    end_time=chunk_end,
+                    text=chunk_text
+                ))
+                
+                # Next chunk starts with overlap
+                current_start = chunk_start + base_duration_per_chunk - overlap_s
+        
+        # Handle single chunk case
+        if len(chunks) == 1:
+            segments.append(SubtitleSegment(
+                start_time=chunk_start,
+                end_time=chunk_end,
+                text=chunks[0]
+            ))
+        
+        logger.debug(f"CapCut timing: {len(segments)} segments with {overlap_s*1000:.0f}ms overlaps")
+        
+        return segments
+    
     def _format_time_srt(self, seconds: float) -> str:
         """Format time for SRT format (HH:MM:SS,mmm).
         
@@ -157,22 +271,31 @@ class SubtitleProcessor:
         return f"{hours:02d}:{minutes:02d}:{secs:02d}.{millisecs:03d}"
     
     def _format_time_simple(self, seconds: float) -> str:
-        """Format time in a simple readable format (MM:SS).
+        """Format time in a simple readable format with milliseconds for CapCut mode.
         
         Args:
             seconds: Time in seconds
             
         Returns:
-            Formatted time string (MM:SS or HH:MM:SS)
+            Formatted time string (MM:SS.mmm for CapCut, MM:SS for traditional)
         """
         hours = int(seconds // 3600)
         minutes = int((seconds % 3600) // 60)
         secs = int(seconds % 60)
+        millisecs = int((seconds % 1) * 1000)
         
-        if hours > 0:
-            return f"{hours:02d}:{minutes:02d}:{secs:02d}"
+        if self.capcut_mode:
+            # Show milliseconds for CapCut mode
+            if hours > 0:
+                return f"{hours:02d}:{minutes:02d}:{secs:02d}.{millisecs:03d}"
+            else:
+                return f"{minutes:02d}:{secs:02d}.{millisecs:03d}"
         else:
-            return f"{minutes:02d}:{secs:02d}"
+            # Traditional format without milliseconds
+            if hours > 0:
+                return f"{hours:02d}:{minutes:02d}:{secs:02d}"
+            else:
+                return f"{minutes:02d}:{secs:02d}"
     
     def _groq_segments_to_subtitle_segments(self, groq_segments: List[Any]) -> List[SubtitleSegment]:
         """Convert Groq transcription segments to subtitle segments.
@@ -227,63 +350,72 @@ class SubtitleProcessor:
             # Merge micro-gaps
             merged_segments = self._merge_micro_gaps(subtitle_segments)
             
-            # Wrap text for each segment and handle overflow
+            # Process segments based on mode
             final_segments = []
-            for segment in merged_segments:
-                current_text = segment.text
-                current_start = segment.start_time
-                segment_duration = segment.end_time - segment.start_time
+            
+            if self.capcut_mode:
+                # CapCut-style: Create punch word chunks with overlapping timing
+                logger.info(f"🎬 Processing in CapCut mode: creating punch-word chunks")
                 
-                # Keep processing until all text is handled
-                iteration = 0
-                while current_text.strip():
-                    iteration += 1
-                    wrapped_lines, remaining_text = self._wrap_text(current_text)
+                for segment in merged_segments:
+                    word_chunks = self._create_capcut_word_chunks(
+                        text=segment.text,
+                        start_time=segment.start_time,
+                        end_time=segment.end_time
+                    )
+                    final_segments.extend(word_chunks)
                     
-                    if wrapped_lines:
-                        # Calculate duration for this sub-segment
-                        if remaining_text.strip():
-                            # If there's remaining text, this is a partial segment
-                            # Estimate duration based on character proportion
-                            chars_used = sum(len(line) for line in wrapped_lines)
-                            total_chars = len(segment.text)
-                            duration_fraction = chars_used / total_chars if total_chars > 0 else 1.0
-                            sub_duration = segment_duration * duration_fraction
-                            current_end = current_start + sub_duration
+                    logger.debug(f"CapCut segment '{segment.text[:30]}...' -> {len(word_chunks)} word chunks")
+                
+            else:
+                # Legacy mode: Traditional text wrapping with splitting
+                logger.info(f"📝 Processing in Legacy mode: traditional subtitle wrapping")
+                
+                for segment in merged_segments:
+                    current_text = segment.text
+                    current_start = segment.start_time
+                    segment_duration = segment.end_time - segment.start_time
+                    
+                    # Keep processing until all text is handled
+                    iteration = 0
+                    while current_text.strip():
+                        iteration += 1
+                        wrapped_lines, remaining_text = self._wrap_text(current_text)
+                        
+                        if wrapped_lines:
+                            # Calculate duration for this sub-segment
+                            if remaining_text.strip():
+                                # If there's remaining text, this is a partial segment
+                                # Estimate duration based on character proportion
+                                chars_used = sum(len(line) for line in wrapped_lines)
+                                total_chars = len(segment.text)
+                                duration_fraction = chars_used / total_chars if total_chars > 0 else 1.0
+                                sub_duration = segment_duration * duration_fraction
+                                current_end = current_start + sub_duration
+                                
+                                logger.debug(f"Split segment {iteration}: '{' '.join(wrapped_lines)[:50]}...' + remaining: '{remaining_text[:30]}...'")
+                            else:
+                                # Last segment gets remaining time
+                                current_end = segment.end_time
                             
-                            # Debug: Check for word duplication
-                            wrapped_text = " ".join(wrapped_lines)
-                            wrapped_words = wrapped_text.split()
-                            remaining_words = remaining_text.split()
+                            final_segments.append(SubtitleSegment(
+                                start_time=current_start,
+                                end_time=current_end,
+                                text="\n".join(wrapped_lines)
+                            ))
                             
-                            if wrapped_words and remaining_words and wrapped_words[-1] == remaining_words[0]:
-                                logger.warning(f"🐛 WORD DUPLICATION DETECTED: '{wrapped_words[-1]}' appears in both wrapped and remaining!")
-                                logger.warning(f"   Wrapped: '{wrapped_text}'")
-                                logger.warning(f"   Remaining: '{remaining_text}'")
-                            
-                            logger.debug(f"Split segment {iteration}: '{wrapped_text[:50]}...' + remaining: '{remaining_text[:30]}...'")
+                            # Update for next iteration
+                            current_text = remaining_text
+                            current_start = current_end
                         else:
-                            # Last segment gets remaining time
-                            current_end = segment.end_time
+                            # No lines could be wrapped (shouldn't happen)
+                            logger.warning(f"Could not wrap text: '{current_text[:50]}...'")
+                            break
                         
-                        final_segments.append(SubtitleSegment(
-                            start_time=current_start,
-                            end_time=current_end,
-                            text="\n".join(wrapped_lines)
-                        ))
-                        
-                        # Update for next iteration
-                        current_text = remaining_text
-                        current_start = current_end
-                    else:
-                        # No lines could be wrapped (shouldn't happen)
-                        logger.warning(f"Could not wrap text: '{current_text[:50]}...'")
-                        break
-                    
-                    # Safety check to prevent infinite loops
-                    if iteration > 10:
-                        logger.warning(f"Text wrapping reached maximum iterations for segment, truncating remaining: '{current_text[:50]}...'")
-                        break
+                        # Safety check to prevent infinite loops
+                        if iteration > 10:
+                            logger.warning(f"Text wrapping reached maximum iterations for segment, truncating remaining: '{current_text[:50]}...'")
+                            break
             
             logger.info(f"Final processed segments: {len(final_segments)}")
             
@@ -425,9 +557,13 @@ def convert_groq_to_subtitles(
     groq_segments: List[Any],
     output_dir: str,
     filename_base: str,
-    max_chars_per_line: int = 50,  # Increased from 42 for less aggressive wrapping
-    max_lines: int = 2,
-    merge_gap_threshold_ms: int = 200
+    max_chars_per_line: int = 50,  # Legacy parameter
+    max_lines: int = 2,  # Legacy parameter
+    merge_gap_threshold_ms: int = 200,
+    capcut_mode: bool = True,  # Enable CapCut-style punch words by default
+    min_word_duration_ms: int = 600,  # CapCut: Min display time per word chunk
+    max_word_duration_ms: int = 1200,  # CapCut: Max display time per word chunk
+    word_overlap_ms: int = 200  # CapCut: Overlap between word chunks
 ) -> Tuple[str, str]:
     """Convenience function to convert Groq segments to subtitle files.
     
@@ -435,13 +571,25 @@ def convert_groq_to_subtitles(
         groq_segments: Groq transcription segments
         output_dir: Output directory path
         filename_base: Base filename without extension
-        max_chars_per_line: Maximum characters per subtitle line
-        max_lines: Maximum number of lines per subtitle
+        max_chars_per_line: Maximum characters per subtitle line (legacy mode only)
+        max_lines: Maximum number of lines per subtitle (legacy mode only)
         merge_gap_threshold_ms: Merge segments with gaps smaller than this (ms)
+        capcut_mode: Enable CapCut-style 1-3 word punch subtitles with overlaps
+        min_word_duration_ms: Minimum display time per word chunk (CapCut mode)
+        max_word_duration_ms: Maximum display time per word chunk (CapCut mode)
+        word_overlap_ms: Overlap between word chunks for smooth transitions (CapCut mode)
         
     Returns:
         Tuple of (srt_path, vtt_path)
     """
-    processor = SubtitleProcessor(max_chars_per_line, max_lines, merge_gap_threshold_ms)
+    processor = SubtitleProcessor(
+        max_chars_per_line=max_chars_per_line,
+        max_lines=max_lines,
+        merge_gap_threshold_ms=merge_gap_threshold_ms,
+        capcut_mode=capcut_mode,
+        min_word_duration_ms=min_word_duration_ms,
+        max_word_duration_ms=max_word_duration_ms,
+        word_overlap_ms=word_overlap_ms
+    )
     segments = processor.process_segments(groq_segments)
     return processor.save_subtitles(segments, output_dir, filename_base) 

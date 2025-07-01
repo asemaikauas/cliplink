@@ -72,10 +72,16 @@ GROQ_API_KEY=your_groq_api_key_here
 VAD_SILENCE_THRESHOLD=-60    # More conservative than default -55
 VAD_MIN_SILENCE_DURATION=7000  # More conservative than default 5000
 
-# Subtitle Formatting (NEW: prevent text truncation)
-SUBTITLE_MAX_CHARS_PER_LINE=50   # Default: 50 (increased from 42)
-SUBTITLE_MAX_LINES=2             # Default: 2 lines per subtitle
+# Subtitle Formatting
+SUBTITLE_MAX_CHARS_PER_LINE=50   # Default: 50 (legacy mode only)
+SUBTITLE_MAX_LINES=2             # Default: 2 lines per subtitle (legacy mode only)
 SUBTITLE_MERGE_GAP_MS=200        # Default: 200ms gap merging
+
+# CapCut-Style Punch Words (NEW: default mode)
+SUBTITLE_CAPCUT_MODE=true        # Enable CapCut-style 1-3 word chunks
+CAPCUT_MIN_WORD_DURATION_MS=600  # Minimum display time per word chunk
+CAPCUT_MAX_WORD_DURATION_MS=1200 # Maximum display time per word chunk  
+CAPCUT_WORD_OVERLAP_MS=200       # Overlap between chunks for smooth flow
 
 # Example: Very conservative settings for quiet speech
 # VAD_SILENCE_THRESHOLD=-65
@@ -89,15 +95,36 @@ SUBTITLE_MERGE_GAP_MS=200        # Default: 200ms gap merging
 # Just use disable_vad=true in API calls instead
 ```
 
+## CapCut vs Traditional Subtitle Modes
+
+### **CapCut Mode (Default)** - Punch Words
+```
+[1] 00:00.000 --> 00:00.800  "you know"
+[2] 00:00.600 --> 00:01.400  "an agent"  
+[3] 00:01.200 --> 00:02.000  "a chat tool"
+[4] 00:01.800 --> 00:02.600  "on the side"
+```
+✅ **Perfect for**: Social media, short clips, viral content  
+✅ **Features**: Large fonts, rapid-fire words, overlapping timing  
+
+### **Traditional Mode** - Full Sentences  
+```
+[1] 00:00 --> 00:04  "you know, an agent, a chat tool on the side to say, hey, you know, this is how you can learn"
+[2] 00:04 --> 00:07  "coding. This is kind of how you can fix your bugs."
+```
+✅ **Perfect for**: Long-form content, lectures, documentaries  
+✅ **Features**: Complete sentences, no overlaps  
+
 ## When to Use Each Approach
 
-| Content Type | Recommendation |
-|--------------|----------------|
-| **Podcasts/Interviews** | Disable VAD (`disable_vad=true`) |
-| **Lectures** | Conservative VAD (`-60dB`, `7000ms`) |
-| **Music with vocals** | Disable VAD |
-| **Noisy environments** | Standard or aggressive VAD |
-| **Clean studio audio** | Standard VAD settings |
+| Content Type | VAD Setting | Subtitle Mode |
+|--------------|-------------|---------------|
+| **TikTok/Shorts** | Disable VAD | CapCut punch words |
+| **Podcasts/Interviews** | Disable VAD | Traditional full sentences |
+| **Lectures** | Conservative VAD | Traditional full sentences |
+| **Music with vocals** | Disable VAD | CapCut punch words |
+| **Viral clips** | Disable VAD | CapCut punch words |
+| **Documentaries** | Standard VAD | Traditional full sentences |
 
 ## Testing Your Settings
 

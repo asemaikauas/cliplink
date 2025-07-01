@@ -186,9 +186,19 @@ async def create_subtitles(
         
         logger.info(f"📝 Generating SRT and VTT subtitle files...")
         
+        # Configure subtitle processing parameters
         max_chars_per_line = int(os.getenv("SUBTITLE_MAX_CHARS_PER_LINE", 50))
         max_lines = int(os.getenv("SUBTITLE_MAX_LINES", 2))
         merge_gap_threshold = int(os.getenv("SUBTITLE_MERGE_GAP_MS", 200))
+        
+        # CapCut-style parameters
+        capcut_mode = os.getenv("SUBTITLE_CAPCUT_MODE", "true").lower() == "true"
+        min_word_duration = int(os.getenv("CAPCUT_MIN_WORD_DURATION_MS", 600))
+        max_word_duration = int(os.getenv("CAPCUT_MAX_WORD_DURATION_MS", 1200))
+        word_overlap = int(os.getenv("CAPCUT_WORD_OVERLAP_MS", 200))
+        
+        mode_name = "CapCut punch-word" if capcut_mode else "Traditional"
+        logger.info(f"🎬 Subtitle mode: {mode_name} style")
         
         srt_path, vtt_path = convert_groq_to_subtitles(
             groq_segments=transcription_result["segments"],
@@ -196,7 +206,11 @@ async def create_subtitles(
             filename_base=filename_base,
             max_chars_per_line=max_chars_per_line,
             max_lines=max_lines,
-            merge_gap_threshold_ms=merge_gap_threshold
+            merge_gap_threshold_ms=merge_gap_threshold,
+            capcut_mode=capcut_mode,
+            min_word_duration_ms=min_word_duration,
+            max_word_duration_ms=max_word_duration,
+            word_overlap_ms=word_overlap
         )
         
         stage_elapsed = int((time.time() - stage_start) * 1000)
