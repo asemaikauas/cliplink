@@ -30,7 +30,7 @@ class SubtitleProcessor:
     
     def __init__(
         self,
-        max_chars_per_line: int = 42,
+        max_chars_per_line: int = 50,  # Increased from 42 for less aggressive wrapping
         max_lines: int = 2,
         merge_gap_threshold_ms: int = 200
     ):
@@ -81,20 +81,21 @@ class SubtitleProcessor:
         logger.info(f"Merged {len(segments)} segments into {len(merged)} segments")
         return merged
     
-    def _wrap_text(self, text: str) -> List[str]:
+    def _wrap_text(self, text: str) -> Tuple[List[str], str]:
         """Wrap text to meet line length and count constraints.
         
         Args:
             text: Text to wrap
             
         Returns:
-            List of wrapped lines
+            Tuple of (wrapped_lines, remaining_text)
         """
         words = text.split()
         lines = []
         current_line = ""
+        remaining_words = []
         
-        for word in words:
+        for i, word in enumerate(words):
             # Check if adding this word would exceed line length
             test_line = f"{current_line} {word}".strip()
             
@@ -106,15 +107,22 @@ class SubtitleProcessor:
                     lines.append(current_line)
                 current_line = word
                 
-                # If we've reached max lines, truncate
+                # If we've reached max lines, save remaining words starting from NEXT word
                 if len(lines) >= self.max_lines:
+                    # Current word goes in current_line, remaining starts from next word
+                    remaining_words = words[i + 1:]  # Start from NEXT word, not current
                     break
         
-        # Add the last line
+        # Add the last line if we haven't exceeded max lines
         if current_line and len(lines) < self.max_lines:
             lines.append(current_line)
+        elif current_line and len(lines) >= self.max_lines:
+            # If we have a current line but reached max lines, add it to remaining
+            remaining_words = [current_line] + remaining_words
         
-        return lines
+        remaining_text = " ".join(remaining_words) if remaining_words else ""
+        
+        return lines, remaining_text
     
     def _format_time_srt(self, seconds: float) -> str:
         """Format time for SRT format (HH:MM:SS,mmm).
@@ -219,16 +227,63 @@ class SubtitleProcessor:
             # Merge micro-gaps
             merged_segments = self._merge_micro_gaps(subtitle_segments)
             
-            # Wrap text for each segment
+            # Wrap text for each segment and handle overflow
             final_segments = []
             for segment in merged_segments:
-                wrapped_lines = self._wrap_text(segment.text)
-                if wrapped_lines:
-                    final_segments.append(SubtitleSegment(
-                        start_time=segment.start_time,
-                        end_time=segment.end_time,
-                        text="\n".join(wrapped_lines)
-                    ))
+                current_text = segment.text
+                current_start = segment.start_time
+                segment_duration = segment.end_time - segment.start_time
+                
+                # Keep processing until all text is handled
+                iteration = 0
+                while current_text.strip():
+                    iteration += 1
+                    wrapped_lines, remaining_text = self._wrap_text(current_text)
+                    
+                    if wrapped_lines:
+                        # Calculate duration for this sub-segment
+                        if remaining_text.strip():
+                            # If there's remaining text, this is a partial segment
+                            # Estimate duration based on character proportion
+                            chars_used = sum(len(line) for line in wrapped_lines)
+                            total_chars = len(segment.text)
+                            duration_fraction = chars_used / total_chars if total_chars > 0 else 1.0
+                            sub_duration = segment_duration * duration_fraction
+                            current_end = current_start + sub_duration
+                            
+                            # Debug: Check for word duplication
+                            wrapped_text = " ".join(wrapped_lines)
+                            wrapped_words = wrapped_text.split()
+                            remaining_words = remaining_text.split()
+                            
+                            if wrapped_words and remaining_words and wrapped_words[-1] == remaining_words[0]:
+                                logger.warning(f"🐛 WORD DUPLICATION DETECTED: '{wrapped_words[-1]}' appears in both wrapped and remaining!")
+                                logger.warning(f"   Wrapped: '{wrapped_text}'")
+                                logger.warning(f"   Remaining: '{remaining_text}'")
+                            
+                            logger.debug(f"Split segment {iteration}: '{wrapped_text[:50]}...' + remaining: '{remaining_text[:30]}...'")
+                        else:
+                            # Last segment gets remaining time
+                            current_end = segment.end_time
+                        
+                        final_segments.append(SubtitleSegment(
+                            start_time=current_start,
+                            end_time=current_end,
+                            text="\n".join(wrapped_lines)
+                        ))
+                        
+                        # Update for next iteration
+                        current_text = remaining_text
+                        current_start = current_end
+                    else:
+                        # No lines could be wrapped (shouldn't happen)
+                        logger.warning(f"Could not wrap text: '{current_text[:50]}...'")
+                        break
+                    
+                    # Safety check to prevent infinite loops
+                    if iteration > 10:
+                        logger.warning(f"Text wrapping reached maximum iterations for segment, truncating remaining: '{current_text[:50]}...'")
+                        break
             
             logger.info(f"Final processed segments: {len(final_segments)}")
             
@@ -370,7 +425,7 @@ def convert_groq_to_subtitles(
     groq_segments: List[Any],
     output_dir: str,
     filename_base: str,
-    max_chars_per_line: int = 42,
+    max_chars_per_line: int = 50,  # Increased from 42 for less aggressive wrapping
     max_lines: int = 2,
     merge_gap_threshold_ms: int = 200
 ) -> Tuple[str, str]:

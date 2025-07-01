@@ -185,10 +185,18 @@ async def create_subtitles(
         _log_stage(task_id, "subtitle_generation_start", stage_elapsed)
         
         logger.info(f"📝 Generating SRT and VTT subtitle files...")
+        
+        max_chars_per_line = int(os.getenv("SUBTITLE_MAX_CHARS_PER_LINE", 50))
+        max_lines = int(os.getenv("SUBTITLE_MAX_LINES", 2))
+        merge_gap_threshold = int(os.getenv("SUBTITLE_MERGE_GAP_MS", 200))
+        
         srt_path, vtt_path = convert_groq_to_subtitles(
             groq_segments=transcription_result["segments"],
             output_dir=str(output_dir),
-            filename_base=filename_base
+            filename_base=filename_base,
+            max_chars_per_line=max_chars_per_line,
+            max_lines=max_lines,
+            merge_gap_threshold_ms=merge_gap_threshold
         )
         
         stage_elapsed = int((time.time() - stage_start) * 1000)

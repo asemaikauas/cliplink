@@ -76,6 +76,16 @@ class GroqClient:
             
             logger.info(f"Found {len(silent_segments)} silent segments to remove")
             
+            # Calculate total duration being removed
+            total_removed_ms = sum(end - start for start, end in silent_segments)
+            original_duration_ms = len(audio)
+            
+            logger.info(f"VAD will remove {total_removed_ms/1000:.1f}s of silence from {original_duration_ms/1000:.1f}s audio ({total_removed_ms/original_duration_ms*100:.1f}%)")
+            
+            # Warn if removing too much content
+            if total_removed_ms / original_duration_ms > 0.5:
+                logger.warning(f"⚠️ VAD is removing >50% of audio content! Consider disabling VAD or adjusting parameters.")
+            
             # Remove silent segments (in reverse order to maintain indices)
             for start, end in reversed(silent_segments):
                 logger.debug(f"Removing silence from {start}ms to {end}ms")
