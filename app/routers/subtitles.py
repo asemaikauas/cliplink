@@ -59,6 +59,7 @@ async def create_subtitles(
     font_size_pct: float = Form(4.5, ge=1.0, le=10.0, description="Font size as percentage of video height"),
     export_codec: str = Form("h264", description="Video codec for output (h264, h265, etc.)"),
     disable_vad: bool = Form(True, description="Disable VAD filtering (enabled by default for better performance)"),
+    speech_sync: bool = Form(False, description="Enable true speech synchronization using word-level timestamps"),
     background_tasks: BackgroundTasks = None
 ) -> SubtitleResponse:
     """Create subtitles for an uploaded video file.
@@ -197,8 +198,27 @@ async def create_subtitles(
         max_word_duration = int(os.getenv("CAPCUT_MAX_WORD_DURATION_MS", 1500))  # Increased for better flow
         word_overlap = int(os.getenv("CAPCUT_WORD_OVERLAP_MS", 150))  # Reduced overlap for clarity
         
-        mode_name = "CapCut punch-word" if capcut_mode else "Traditional"
+        # Determine subtitle mode
+        if speech_sync:
+            mode_name = "Speech-synchronized"
+            # Speech sync takes priority - disable capcut mode to avoid conflicts
+            actual_capcut_mode = False
+        elif capcut_mode:
+            mode_name = "CapCut adaptive-word"
+            actual_capcut_mode = True
+        else:
+            mode_name = "Traditional"
+            actual_capcut_mode = False
+        
         logger.info(f"🎬 Subtitle mode: {mode_name} style")
+        
+        # Get word timestamps for speech sync
+        word_timestamps = transcription_result.get("word_timestamps", []) if speech_sync else None
+        if speech_sync and word_timestamps:
+            logger.info(f"🎯 Using {len(word_timestamps)} word timestamps for speech sync")
+        elif speech_sync:
+            logger.warning("⚠️ Speech sync requested but no word timestamps available, falling back to CapCut mode")
+            actual_capcut_mode = True
         
         srt_path, vtt_path = convert_groq_to_subtitles(
             groq_segments=transcription_result["segments"],
@@ -207,7 +227,9 @@ async def create_subtitles(
             max_chars_per_line=max_chars_per_line,
             max_lines=max_lines,
             merge_gap_threshold_ms=merge_gap_threshold,
-            capcut_mode=capcut_mode,
+            capcut_mode=actual_capcut_mode,
+            speech_sync_mode=speech_sync,
+            word_timestamps=word_timestamps,
             min_word_duration_ms=min_word_duration,
             max_word_duration_ms=max_word_duration,
             word_overlap_ms=word_overlap

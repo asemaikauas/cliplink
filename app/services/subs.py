@@ -34,6 +34,7 @@ class SubtitleProcessor:
         max_lines: int = 2,  # Legacy parameter - not used in CapCut mode  
         merge_gap_threshold_ms: int = 200,
         capcut_mode: bool = True,  # Enable CapCut-style punch words
+        speech_sync_mode: bool = False,  # Enable true speech synchronization using word timestamps
         min_word_duration_ms: int = 800,  # Minimum display time per word chunk
         max_word_duration_ms: int = 1500,  # Maximum display time per word chunk
         word_overlap_ms: int = 150  # Overlap between word chunks for smooth flow
@@ -44,7 +45,8 @@ class SubtitleProcessor:
             max_chars_per_line: Maximum characters per subtitle line (legacy)
             max_lines: Maximum number of lines per subtitle (legacy)
             merge_gap_threshold_ms: Merge segments with gaps smaller than this (ms)
-            capcut_mode: Enable CapCut-style 1-3 word punch subtitles
+            capcut_mode: Enable CapCut-style adaptive word chunks
+            speech_sync_mode: Enable true speech synchronization using word timestamps
             min_word_duration_ms: Minimum display time per word chunk (ms)
             max_word_duration_ms: Maximum display time per word chunk (ms)  
             word_overlap_ms: Overlap between word chunks for smooth transitions (ms)
@@ -53,6 +55,7 @@ class SubtitleProcessor:
         self.max_lines = max_lines
         self.merge_gap_threshold_ms = merge_gap_threshold_ms
         self.capcut_mode = capcut_mode
+        self.speech_sync_mode = speech_sync_mode
         self.min_word_duration_ms = min_word_duration_ms
         self.max_word_duration_ms = max_word_duration_ms
         self.word_overlap_ms = word_overlap_ms
@@ -286,6 +289,131 @@ class SubtitleProcessor:
         
         return segments
     
+    def _create_speech_sync_chunks(self, word_timestamps: List[Any]) -> List[SubtitleSegment]:
+        """Create speech-synchronized chunks using actual word timing from Groq.
+        
+        Args:
+            word_timestamps: List of word objects with start/end timing from Groq
+            
+        Returns:
+            List of subtitle segments with true speech timing
+        """
+        if not word_timestamps:
+            logger.warning("No word timestamps provided for speech sync")
+            return []
+        
+        segments = []
+        min_duration_s = self.min_word_duration_ms / 1000.0
+        max_duration_s = self.max_word_duration_ms / 1000.0
+        
+        # Process words and group them into natural chunks
+        current_chunk_words = []
+        current_chunk_start = None
+        current_chunk_end = None
+        
+        logger.info(f"🎯 Creating speech-sync chunks from {len(word_timestamps)} words")
+        
+        for i, word_obj in enumerate(word_timestamps):
+            # Extract word data (handle both dict and object formats)
+            if isinstance(word_obj, dict):
+                word_text = word_obj.get('word', '').strip()
+                word_start = float(word_obj.get('start', 0))
+                word_end = float(word_obj.get('end', 0))
+            else:
+                word_text = getattr(word_obj, 'word', '').strip()
+                word_start = float(getattr(word_obj, 'start', 0))
+                word_end = float(getattr(word_obj, 'end', 0))
+            
+            if not word_text:
+                continue
+            
+            # Start new chunk if this is the first word
+            if current_chunk_start is None:
+                current_chunk_start = word_start
+                current_chunk_words = [word_text]
+                current_chunk_end = word_end
+                continue
+            
+            # Calculate current chunk duration if we add this word
+            potential_duration = word_end - current_chunk_start
+            current_text_length = len(" ".join(current_chunk_words + [word_text]))
+            
+            # Decide whether to add word to current chunk or start new chunk
+            should_break = False
+            
+            # Break conditions:
+            # 1. Chunk would be too long (over max duration)
+            if potential_duration > max_duration_s:
+                should_break = True
+                logger.debug(f"Breaking chunk due to max duration: {potential_duration:.2f}s > {max_duration_s:.2f}s")
+            
+            # 2. Too much text for readability (over 50 characters)
+            elif current_text_length > 50:
+                should_break = True
+                logger.debug(f"Breaking chunk due to text length: {current_text_length} chars")
+            
+            # 3. Natural break points (punctuation)
+            elif (current_chunk_words and 
+                  any(current_chunk_words[-1].endswith(p) for p in ['.', ',', '!', '?', ':', ';'])):
+                should_break = True
+                logger.debug(f"Breaking chunk due to punctuation: '{current_chunk_words[-1]}'")
+            
+            # 4. Too many words (over 6)
+            elif len(current_chunk_words) >= 6:
+                should_break = True
+                logger.debug(f"Breaking chunk due to word count: {len(current_chunk_words)} words")
+            
+            # 5. Large time gap between words (>0.5s pause)
+            elif word_start - current_chunk_end > 0.5:
+                should_break = True
+                logger.debug(f"Breaking chunk due to speech gap: {word_start - current_chunk_end:.2f}s")
+            
+            if should_break and current_chunk_words:
+                # Finalize current chunk
+                chunk_duration = current_chunk_end - current_chunk_start
+                
+                # Ensure minimum duration for readability
+                if chunk_duration < min_duration_s:
+                    current_chunk_end = current_chunk_start + min_duration_s
+                
+                chunk_text = " ".join(current_chunk_words)
+                segments.append(SubtitleSegment(
+                    start_time=current_chunk_start,
+                    end_time=current_chunk_end,
+                    text=chunk_text
+                ))
+                
+                logger.debug(f"Speech-sync chunk: '{chunk_text}' ({current_chunk_start:.3f}s - {current_chunk_end:.3f}s)")
+                
+                # Start new chunk with current word
+                current_chunk_start = word_start
+                current_chunk_words = [word_text]
+                current_chunk_end = word_end
+            else:
+                # Add word to current chunk
+                current_chunk_words.append(word_text)
+                current_chunk_end = word_end
+        
+        # Handle final chunk
+        if current_chunk_words and current_chunk_start is not None:
+            chunk_duration = current_chunk_end - current_chunk_start
+            
+            # Ensure minimum duration for readability
+            if chunk_duration < min_duration_s:
+                current_chunk_end = current_chunk_start + min_duration_s
+            
+            chunk_text = " ".join(current_chunk_words)
+            segments.append(SubtitleSegment(
+                start_time=current_chunk_start,
+                end_time=current_chunk_end,
+                text=chunk_text
+            ))
+            
+            logger.debug(f"Final speech-sync chunk: '{chunk_text}' ({current_chunk_start:.3f}s - {current_chunk_end:.3f}s)")
+        
+        logger.info(f"🎯 Created {len(segments)} speech-synchronized chunks")
+        return segments
+    
     def _format_time_srt(self, seconds: float) -> str:
         """Format time for SRT format (HH:MM:SS,mmm).
         
@@ -380,16 +508,22 @@ class SubtitleProcessor:
         
         return subtitle_segments
     
-    def process_segments(self, groq_segments: List[Any]) -> List[SubtitleSegment]:
+    def process_segments(self, groq_segments: List[Any], word_timestamps: List[Any] = None) -> List[SubtitleSegment]:
         """Process Groq segments into optimized subtitle segments.
         
         Args:
             groq_segments: Raw Groq transcription segments
+            word_timestamps: Optional word-level timing data for speech sync
             
         Returns:
             Processed subtitle segments
         """
         try:
+            # Speech sync mode takes priority if word timestamps are available
+            if self.speech_sync_mode and word_timestamps:
+                logger.info(f"🎯 Processing {len(word_timestamps)} words in SPEECH SYNC mode")
+                return self._create_speech_sync_chunks(word_timestamps)
+            
             logger.info(f"Processing {len(groq_segments)} Groq segments")
             
             # Convert to subtitle segments
@@ -609,6 +743,8 @@ def convert_groq_to_subtitles(
     max_lines: int = 2,  # Legacy parameter
     merge_gap_threshold_ms: int = 200,
     capcut_mode: bool = True,  # Enable CapCut-style punch words by default
+    speech_sync_mode: bool = False,  # Enable true speech synchronization
+    word_timestamps: List[Any] = None,  # Word-level timing data for speech sync
     min_word_duration_ms: int = 800,  # CapCut: Min display time per word chunk
     max_word_duration_ms: int = 1500,  # CapCut: Max display time per word chunk
     word_overlap_ms: int = 150  # CapCut: Overlap between word chunks
@@ -622,10 +758,12 @@ def convert_groq_to_subtitles(
         max_chars_per_line: Maximum characters per subtitle line (legacy mode only)
         max_lines: Maximum number of lines per subtitle (legacy mode only)
         merge_gap_threshold_ms: Merge segments with gaps smaller than this (ms)
-        capcut_mode: Enable CapCut-style 1-3 word punch subtitles with overlaps
-        min_word_duration_ms: Minimum display time per word chunk (CapCut mode)
-        max_word_duration_ms: Maximum display time per word chunk (CapCut mode)
-        word_overlap_ms: Overlap between word chunks for smooth transitions (CapCut mode)
+        capcut_mode: Enable CapCut-style adaptive word chunks
+        speech_sync_mode: Enable true speech synchronization using word timestamps
+        word_timestamps: Word-level timing data from Groq for speech sync
+        min_word_duration_ms: Minimum display time per word chunk
+        max_word_duration_ms: Maximum display time per word chunk
+        word_overlap_ms: Overlap between word chunks for smooth transitions
         
     Returns:
         Tuple of (srt_path, vtt_path)
@@ -635,9 +773,10 @@ def convert_groq_to_subtitles(
         max_lines=max_lines,
         merge_gap_threshold_ms=merge_gap_threshold_ms,
         capcut_mode=capcut_mode,
+        speech_sync_mode=speech_sync_mode,
         min_word_duration_ms=min_word_duration_ms,
         max_word_duration_ms=max_word_duration_ms,
         word_overlap_ms=word_overlap_ms
     )
-    segments = processor.process_segments(groq_segments)
+    segments = processor.process_segments(groq_segments, word_timestamps)
     return processor.save_subtitles(segments, output_dir, filename_base) 

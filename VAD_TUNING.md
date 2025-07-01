@@ -77,8 +77,8 @@ SUBTITLE_MAX_CHARS_PER_LINE=50   # Default: 50 (legacy mode only)
 SUBTITLE_MAX_LINES=2             # Default: 2 lines per subtitle (legacy mode only)
 SUBTITLE_MERGE_GAP_MS=200        # Default: 200ms gap merging
 
-# CapCut-Style Larger Sequential Punch Words (NEW: default mode)
-SUBTITLE_CAPCUT_MODE=true        # Enable CapCut-style 4-6 word chunks (fewer total segments)
+# CapCut-Style Adaptive Sequential Punch Words (NEW: default mode)
+SUBTITLE_CAPCUT_MODE=true        # Enable CapCut-style adaptive chunks (3-6 words, natural breaks)
 CAPCUT_MIN_WORD_DURATION_MS=800  # Minimum display time per chunk (800ms = better readability)
 CAPCUT_MAX_WORD_DURATION_MS=1500 # Maximum display time per chunk (1500ms = smoother flow)
 CAPCUT_WORD_OVERLAP_MS=150       # Not used in sequential mode, kept for legacy compatibility

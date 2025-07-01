@@ -148,22 +148,39 @@ class GroqClient:
                     language=language
                 )
             
-            # Debug: Print what we got from Groq
+            # Debug: Print what we got from Groq including word-level data
             print(f"\n🔍 DEBUG - Groq Response for task {task_id}:")
             print(f"   Has segments attr: {hasattr(transcription, 'segments')}")
             print(f"   Segments is None: {getattr(transcription, 'segments', 'NO_ATTR') is None}")
+            print(f"   Has words attr: {hasattr(transcription, 'words')}")
+            print(f"   Words is None: {getattr(transcription, 'words', 'NO_ATTR') is None}")
             print(f"   Has text attr: {hasattr(transcription, 'text')}")
             print(f"   Text content: {getattr(transcription, 'text', 'NO_TEXT')[:100] if hasattr(transcription, 'text') else 'NO_TEXT'}...")
             print(f"   Language: {getattr(transcription, 'language', 'NO_LANGUAGE')}")
+            
             if hasattr(transcription, 'segments') and transcription.segments:
                 print(f"   Segments count: {len(transcription.segments)}")
                 print(f"   First segment type: {type(transcription.segments[0])}")
                 print(f"   First segment content: {transcription.segments[0] if transcription.segments else 'NO_SEGMENTS'}")
                 if transcription.segments and isinstance(transcription.segments[0], dict):
                     print(f"   First segment keys: {list(transcription.segments[0].keys())}")
+            
+            if hasattr(transcription, 'words') and transcription.words:
+                print(f"   Words count: {len(transcription.words)}")
+                print(f"   First word type: {type(transcription.words[0])}")
+                print(f"   First 3 words: {transcription.words[:3] if transcription.words else 'NO_WORDS'}")
+                if transcription.words and isinstance(transcription.words[0], dict):
+                    print(f"   First word keys: {list(transcription.words[0].keys())}")
+            elif hasattr(transcription, 'segments') and transcription.segments:
+                # Check if words are nested in segments
+                first_segment = transcription.segments[0]
+                if isinstance(first_segment, dict) and 'words' in first_segment:
+                    print(f"   Words nested in segments - first segment words: {len(first_segment['words'])} words")
+                    print(f"   First word in segment: {first_segment['words'][0] if first_segment['words'] else 'NO_WORDS'}")
+            
             print() # Empty line for readability
             
-            # Validate the transcription response
+            # Extract both segments and word-level timing data
             if not hasattr(transcription, 'segments'):
                 logger.warning(f"Transcription response missing segments attribute (task_id: {task_id})")
                 segments = []
@@ -172,6 +189,28 @@ class GroqClient:
                 segments = []
             else:
                 segments = transcription.segments
+            
+            # Extract word-level timestamps for speech synchronization
+            word_timestamps = []
+            
+            # Method 1: Check for top-level words attribute
+            if hasattr(transcription, 'words') and transcription.words:
+                logger.info(f"Found {len(transcription.words)} word-level timestamps")
+                word_timestamps = transcription.words
+            # Method 2: Extract words from segments
+            elif segments:
+                logger.info("Extracting word timestamps from segments")
+                for segment in segments:
+                    if isinstance(segment, dict) and 'words' in segment and segment['words']:
+                        word_timestamps.extend(segment['words'])
+                    elif hasattr(segment, 'words') and segment.words:
+                        word_timestamps.extend(segment.words)
+                
+                logger.info(f"Extracted {len(word_timestamps)} word-level timestamps from segments")
+            
+            if word_timestamps:
+                # Debug: show first few word timestamps
+                logger.info(f"🎯 Word-level timing sample: {word_timestamps[:5]}")
             
             # Validate language
             language_code = getattr(transcription, 'language', 'unknown')
@@ -267,6 +306,7 @@ class GroqClient:
             
             return {
                 "segments": segments,
+                "word_timestamps": word_timestamps,  # Add word-level timing for speech sync
                 "language": language_code,
                 "cost_usd": round(cost_usd, 4),
                 "latency_ms": latency_ms
