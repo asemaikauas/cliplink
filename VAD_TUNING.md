@@ -77,10 +77,10 @@ SUBTITLE_MAX_CHARS_PER_LINE=50   # Default: 50 (legacy mode only)
 SUBTITLE_MAX_LINES=2             # Default: 2 lines per subtitle (legacy mode only)
 SUBTITLE_MERGE_GAP_MS=200        # Default: 200ms gap merging
 
-# CapCut-Style Sequential Punch Words (NEW: default mode)
-SUBTITLE_CAPCUT_MODE=true        # Enable CapCut-style 1-3 word chunks
-CAPCUT_MIN_WORD_DURATION_MS=800  # Minimum display time per word chunk (800ms = better readability)
-CAPCUT_MAX_WORD_DURATION_MS=1500 # Maximum display time per word chunk (1500ms = smoother flow)
+# CapCut-Style Larger Sequential Punch Words (NEW: default mode)
+SUBTITLE_CAPCUT_MODE=true        # Enable CapCut-style 4-6 word chunks (fewer total segments)
+CAPCUT_MIN_WORD_DURATION_MS=800  # Minimum display time per chunk (800ms = better readability)
+CAPCUT_MAX_WORD_DURATION_MS=1500 # Maximum display time per chunk (1500ms = smoother flow)
 CAPCUT_WORD_OVERLAP_MS=150       # Not used in sequential mode, kept for legacy compatibility
 
 # Example: Very conservative settings for quiet speech
@@ -97,16 +97,15 @@ CAPCUT_WORD_OVERLAP_MS=150       # Not used in sequential mode, kept for legacy 
 
 ## CapCut vs Traditional Subtitle Modes
 
-### **CapCut Mode (Default)** - Sequential Punch Words
+### **CapCut Mode (Default)** - Adaptive Sequential Punch Words
 ```
-[1] 00:00.000 --> 00:00.960  "you know an"
-[2] 00:00.960 --> 00:01.920  "agent, a chat"     ← Starts exactly when previous ends
-[3] 00:01.920 --> 00:02.880  "tool on the"      ← Perfect sequential flow
-[4] 00:02.880 --> 00:03.840  "side to say"      ← Clean, readable timing
-[5] 00:03.840 --> 00:04.800  "hey, you know"    ← No overlaps, no gaps
+[1] 00:00.000 --> 00:01.200  "you know an agent"         ← 4 words (natural phrase)
+[2] 00:01.200 --> 00:02.600  "a chat tool on the side"   ← 6 words (natural break at "side")
+[3] 00:02.600 --> 00:03.800  "to say, hey"               ← 3 words (comma break)
+[4] 00:03.800 --> 00:04.800  "you know this is how"      ← 5 words (complete thought)
 ```
 ✅ **Perfect for**: Social media, short clips, viral content  
-✅ **Features**: Millisecond precision, 2-3 words per chunk, **sequential timing (no overlaps)**  
+✅ **Features**: **Adaptive chunking** (3-6 words), **natural speech breaks**, **sequential timing**  
 
 ### **Traditional Mode** - Full Sentences  
 ```

@@ -154,33 +154,61 @@ class SubtitleProcessor:
         duration_s = end_time - start_time
         duration_ms = duration_s * 1000
         
-        # Create 1-3 word chunks with smarter grouping
+        # Create adaptive chunks based on natural speech patterns and punctuation
         chunks = []
         i = 0
         while i < len(words):
             remaining_words = len(words) - i
             
-            # Smart chunk size selection
-            if remaining_words >= 5:
-                # Prefer 3-word chunks when we have plenty of words
-                chunk_size = 3
-            elif remaining_words == 4:
-                # Split 4 words into 2+2
-                chunk_size = 2
-            elif remaining_words == 3:
-                # Keep 3 words together
-                chunk_size = 3
-            elif remaining_words == 2:
-                # Keep 2 words together
-                chunk_size = 2
-            else:
-                # Single word
-                chunk_size = 1
+            # Look ahead for natural breaking points (punctuation, conjunctions)
+            natural_break_found = False
+            optimal_chunk_size = 3  # Default fallback
+            
+            # Check for natural breaks within next 3-6 words
+            for look_ahead in range(3, min(7, remaining_words + 1)):
+                if i + look_ahead <= len(words):
+                    # Check the word at this position for natural break indicators
+                    if i + look_ahead < len(words):
+                        next_word = words[i + look_ahead - 1].lower()
+                        
+                        # Natural break indicators
+                        if (next_word.endswith(('.', ',', '!', '?', ':', ';')) or 
+                            next_word in ['and', 'but', 'or', 'so', 'then', 'now', 'well', 'because', 'since', 'while', 'when', 'where', 'how', 'that', 'which', 'who']):
+                            optimal_chunk_size = look_ahead
+                            natural_break_found = True
+                            break
+            
+            # If no natural break found, use adaptive sizing based on content
+            if not natural_break_found:
+                if remaining_words >= 8:
+                    # Longer content: prefer 5-word chunks
+                    optimal_chunk_size = 5
+                elif remaining_words >= 6:
+                    # Medium content: prefer 4-word chunks  
+                    optimal_chunk_size = 4
+                elif remaining_words >= 4:
+                    # Shorter content: use all remaining or split evenly
+                    if remaining_words == 4:
+                        optimal_chunk_size = 4
+                    elif remaining_words == 5:
+                        optimal_chunk_size = 3  # 3+2 split
+                    elif remaining_words == 6:
+                        optimal_chunk_size = 3  # 3+3 split
+                    elif remaining_words == 7:
+                        optimal_chunk_size = 4  # 4+3 split
+                else:
+                    # Very short: use all remaining
+                    optimal_chunk_size = remaining_words
+            
+            # Ensure we don't exceed remaining words
+            chunk_size = min(optimal_chunk_size, remaining_words)
             
             chunk_words = words[i:i+chunk_size]
             chunk_text = " ".join(chunk_words)
             chunks.append(chunk_text)
             i += chunk_size
+            
+            logger.debug(f"Chunk: '{chunk_text}' (size: {chunk_size}, natural_break: {natural_break_found})")
         
         if not chunks:
             return []

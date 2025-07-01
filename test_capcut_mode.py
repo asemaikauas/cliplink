@@ -84,17 +84,22 @@ def test_capcut_mode():
     success = True
     issues = []
     
-    if max_words > 3:
+    if max_words > 7:
         success = False
-        issues.append(f"Some segments have >3 words (max: {max_words})")
+        issues.append(f"Some segments have >7 words (max: {max_words}) - chunks too large")
     
-    if overlaps == 0:
+    if overlaps > 0:
         success = False
-        issues.append("No overlapping segments (CapCut style should have overlaps)")
+        issues.append("Found overlapping segments (sequential mode should have no overlaps)")
     
-    if len(final_segments) < len(test_segments) * 3:
+    # Check for reasonable chunking (not too many tiny segments, not too few huge ones)
+    avg_words_per_chunk = sum(len(seg.text.split()) for seg in final_segments) / len(final_segments)
+    if avg_words_per_chunk < 2.5:
         success = False
-        issues.append("Not enough segmentation for punch-word effect")
+        issues.append(f"Chunks too small on average ({avg_words_per_chunk:.1f} words/chunk)")
+    elif avg_words_per_chunk > 6:
+        success = False
+        issues.append(f"Chunks too large on average ({avg_words_per_chunk:.1f} words/chunk)")
     
     print(f"\n🎯 CapCut Mode Test: {'✅ PASSED' if success else '❌ FAILED'}")
     if issues:
