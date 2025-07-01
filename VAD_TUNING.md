@@ -77,11 +77,11 @@ SUBTITLE_MAX_CHARS_PER_LINE=50   # Default: 50 (legacy mode only)
 SUBTITLE_MAX_LINES=2             # Default: 2 lines per subtitle (legacy mode only)
 SUBTITLE_MERGE_GAP_MS=200        # Default: 200ms gap merging
 
-# CapCut-Style Punch Words (NEW: default mode)
+# CapCut-Style Sequential Punch Words (NEW: default mode)
 SUBTITLE_CAPCUT_MODE=true        # Enable CapCut-style 1-3 word chunks
 CAPCUT_MIN_WORD_DURATION_MS=800  # Minimum display time per word chunk (800ms = better readability)
 CAPCUT_MAX_WORD_DURATION_MS=1500 # Maximum display time per word chunk (1500ms = smoother flow)
-CAPCUT_WORD_OVERLAP_MS=150       # Overlap between chunks for smooth flow (150ms = cleaner transitions)
+CAPCUT_WORD_OVERLAP_MS=150       # Not used in sequential mode, kept for legacy compatibility
 
 # Example: Very conservative settings for quiet speech
 # VAD_SILENCE_THRESHOLD=-65
@@ -97,16 +97,16 @@ CAPCUT_WORD_OVERLAP_MS=150       # Overlap between chunks for smooth flow (150ms
 
 ## CapCut vs Traditional Subtitle Modes
 
-### **CapCut Mode (Default)** - Punch Words
+### **CapCut Mode (Default)** - Sequential Punch Words
 ```
-[1] 00:00.000 --> 00:00.850  "you know an"
-[2] 00:00.700 --> 00:01.600  "agent, a chat"  
-[3] 00:01.450 --> 00:02.450  "tool on the"
-[4] 00:02.300 --> 00:03.300  "side to say"
-[5] 00:03.150 --> 00:04.150  "hey, you know"
+[1] 00:00.000 --> 00:00.960  "you know an"
+[2] 00:00.960 --> 00:01.920  "agent, a chat"     ← Starts exactly when previous ends
+[3] 00:01.920 --> 00:02.880  "tool on the"      ← Perfect sequential flow
+[4] 00:02.880 --> 00:03.840  "side to say"      ← Clean, readable timing
+[5] 00:03.840 --> 00:04.800  "hey, you know"    ← No overlaps, no gaps
 ```
 ✅ **Perfect for**: Social media, short clips, viral content  
-✅ **Features**: Millisecond precision, 2-3 words per chunk, overlapping timing  
+✅ **Features**: Millisecond precision, 2-3 words per chunk, **sequential timing (no overlaps)**  
 
 ### **Traditional Mode** - Full Sentences  
 ```

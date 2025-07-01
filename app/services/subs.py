@@ -205,54 +205,56 @@ class SubtitleProcessor:
                 text=chunks[0]
             ))
         else:
-            # Multiple chunks with precise millisecond timing
-            # Calculate how much time each chunk should get
-            total_duration_ms = duration_ms
+            # Multiple chunks with simple sequential timing (no overlaps)
+            total_duration_s = duration_s
             
-            # Distribute time: each chunk gets minimum duration, rest is distributed
-            total_min_time = len(chunks) * min_duration_ms
-            extra_time = max(0, total_duration_ms - total_min_time)
+            # Simple approach: equal time distribution with minimum duration respect
+            base_duration_s = total_duration_s / len(chunks)
             
-            # Distribute extra time proportionally based on word count
-            chunk_word_counts = [len(chunk.split()) for chunk in chunks]
-            total_words = sum(chunk_word_counts)
+            # Ensure base duration meets minimum requirement
+            min_duration_s = min_duration_ms / 1000.0
+            max_duration_s = max_duration_ms / 1000.0
             
-            current_start_ms = start_time * 1000
+            # If base duration is too short, use minimum and adjust total
+            if base_duration_s < min_duration_s:
+                base_duration_s = min_duration_s
+            elif base_duration_s > max_duration_s:
+                base_duration_s = max_duration_s
             
-            for i, (chunk_text, word_count) in enumerate(zip(chunks, chunk_word_counts)):
-                # Base duration + proportional extra time
-                if total_words > 0:
-                    word_proportion = word_count / total_words
-                    chunk_extra_time = extra_time * word_proportion
-                else:
-                    chunk_extra_time = extra_time / len(chunks)
+            current_start_s = start_time
+            
+            for i, chunk_text in enumerate(chunks):
+                chunk_start_s = current_start_s
                 
-                chunk_duration_ms = min_duration_ms + chunk_extra_time
-                
-                # Cap at maximum duration
-                chunk_duration_ms = min(chunk_duration_ms, max_duration_ms)
-                
-                chunk_start_ms = current_start_ms
-                chunk_end_ms = chunk_start_ms + chunk_duration_ms
-                
-                # Ensure last chunk doesn't exceed original end too much
                 if i == len(chunks) - 1:
-                    max_allowed_end_ms = (end_time + 0.5) * 1000  # Allow 500ms overshoot
-                    chunk_end_ms = min(chunk_end_ms, max_allowed_end_ms)
+                    # Last chunk: end exactly at original end time
+                    chunk_end_s = end_time
+                else:
+                    # Regular chunk: use calculated duration
+                    chunk_end_s = chunk_start_s + base_duration_s
+                    
+                    # Safety check: ensure we don't exceed original end time
+                    if chunk_end_s > end_time:
+                        chunk_end_s = end_time
+                
+                # Safety check: ensure positive duration
+                if chunk_end_s <= chunk_start_s:
+                    chunk_end_s = chunk_start_s + min_duration_s
                 
                 segments.append(SubtitleSegment(
-                    start_time=chunk_start_ms / 1000.0,
-                    end_time=chunk_end_ms / 1000.0,
+                    start_time=chunk_start_s,
+                    end_time=chunk_end_s,
                     text=chunk_text
                 ))
                 
-                # Next chunk starts with overlap
-                current_start_ms = chunk_start_ms + chunk_duration_ms - overlap_ms
+                # Next chunk starts exactly when current chunk ends
+                current_start_s = chunk_end_s
                 
-                # Ensure we don't go negative
-                current_start_ms = max(current_start_ms, chunk_start_ms + 50)  # Min 50ms gap
+                # Safety check: if we've reached the end, stop
+                if current_start_s >= end_time:
+                    break
         
-        logger.debug(f"CapCut timing: {len(segments)} segments with {overlap_ms:.0f}ms overlaps")
+        logger.debug(f"CapCut timing: {len(segments)} sequential segments (no overlaps)")
         
         return segments
     
