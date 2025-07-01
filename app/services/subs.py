@@ -412,7 +412,130 @@ class SubtitleProcessor:
             logger.debug(f"Final speech-sync chunk: '{chunk_text}' ({current_chunk_start:.3f}s - {current_chunk_end:.3f}s)")
         
         logger.info(f"🎯 Created {len(segments)} speech-synchronized chunks")
-        return segments
+        
+        # Post-process to ensure no timing overlaps and add text wrapping
+        return self._fix_timing_overlaps_and_wrap_text(segments)
+    
+    def _fix_timing_overlaps_and_wrap_text(self, segments: List[SubtitleSegment]) -> List[SubtitleSegment]:
+        """Fix timing overlaps and add text wrapping to segments.
+        
+        Args:
+            segments: Input segments that may have timing overlaps
+            
+        Returns:
+            Fixed segments with sequential timing and wrapped text
+        """
+        if not segments:
+            return []
+        
+        logger.debug(f"🔧 Fixing timing overlaps and wrapping text for {len(segments)} segments")
+        
+        fixed_segments = []
+        min_duration_s = self.min_word_duration_ms / 1000.0
+        
+        for i, segment in enumerate(segments):
+            # Handle text wrapping first
+            wrapped_text = self._wrap_text_for_subtitle(segment.text)
+            
+            # Fix timing overlaps
+            start_time = segment.start_time
+            end_time = segment.end_time
+            
+            # Check for overlap with previous segment
+            if fixed_segments and start_time < fixed_segments[-1].end_time:
+                # Overlap detected - adjust start time to be after previous segment
+                previous_end = fixed_segments[-1].end_time
+                gap_ms = 50  # 50ms gap between subtitles for readability
+                start_time = previous_end + (gap_ms / 1000.0)
+                
+                logger.debug(f"Fixed overlap: moved start from {segment.start_time:.3f}s to {start_time:.3f}s")
+            
+            # Ensure minimum duration
+            duration = end_time - start_time
+            if duration < min_duration_s:
+                end_time = start_time + min_duration_s
+                logger.debug(f"Extended duration from {duration:.3f}s to {min_duration_s:.3f}s")
+            
+            # Check if this adjustment would overlap with next segment
+            if i + 1 < len(segments):
+                next_segment = segments[i + 1]
+                if end_time > next_segment.start_time:
+                    # Would overlap with next - cap at next segment start minus small gap
+                    gap_ms = 50
+                    max_end_time = next_segment.start_time - (gap_ms / 1000.0)
+                    if max_end_time > start_time:
+                        end_time = max_end_time
+                        logger.debug(f"Capped end time to avoid next overlap: {end_time:.3f}s")
+            
+            fixed_segments.append(SubtitleSegment(
+                start_time=start_time,
+                end_time=end_time,
+                text=wrapped_text
+            ))
+        
+        logger.info(f"✅ Fixed timing overlaps for {len(fixed_segments)} segments")
+        return fixed_segments
+    
+    def _wrap_text_for_subtitle(self, text: str) -> str:
+        """Wrap long text into multiple lines for better readability.
+        
+        Args:
+            text: Input text that may be too long for one line
+            
+        Returns:
+            Text wrapped into multiple lines with newlines
+        """
+        max_chars_per_line = self.max_chars_per_line
+        max_lines = self.max_lines
+        
+        # If text is short enough, return as-is
+        if len(text) <= max_chars_per_line:
+            return text
+        
+        words = text.split()
+        lines = []
+        current_line = []
+        current_length = 0
+        
+        for word in words:
+            # Check if adding this word would exceed line length
+            word_length = len(word)
+            space_length = 1 if current_line else 0
+            total_length = current_length + space_length + word_length
+            
+            if total_length <= max_chars_per_line or not current_line:
+                # Add word to current line
+                current_line.append(word)
+                current_length = total_length
+            else:
+                # Start new line
+                if current_line:
+                    lines.append(" ".join(current_line))
+                current_line = [word]
+                current_length = word_length
+                
+                # Stop if we've reached max lines
+                if len(lines) >= max_lines - 1:
+                    # Add remaining words to last line
+                    remaining_words = words[words.index(word) + 1:]
+                    if remaining_words:
+                        current_line.extend(remaining_words)
+                    break
+        
+        # Add final line
+        if current_line:
+            lines.append(" ".join(current_line))
+        
+        # Limit to max lines
+        if len(lines) > max_lines:
+            lines = lines[:max_lines]
+        
+        wrapped_text = "\n".join(lines)
+        
+        if len(lines) > 1:
+            logger.debug(f"Wrapped text: '{text}' -> {len(lines)} lines")
+        
+        return wrapped_text
     
     def _format_time_srt(self, seconds: float) -> str:
         """Format time for SRT format (HH:MM:SS,mmm).

@@ -52,6 +52,37 @@ def create_mock_word_timestamps():
     return words
 
 
+def create_problematic_word_timestamps():
+    """Create word timestamps that would cause overlapping issues."""
+    words = [
+        # Very short words that need minimum duration extension
+        {"word": "I", "start": 0.1, "end": 0.15},
+        {"word": "am", "start": 0.2, "end": 0.25}, 
+        {"word": "speaking", "start": 0.3, "end": 0.7},
+        {"word": "very", "start": 0.8, "end": 1.0},
+        {"word": "quickly", "start": 1.1, "end": 1.5},
+        
+        # Long sentence that needs text wrapping
+        {"word": "This", "start": 2.0, "end": 2.2},
+        {"word": "is", "start": 2.3, "end": 2.4},
+        {"word": "an", "start": 2.5, "end": 2.6},
+        {"word": "extremely", "start": 2.7, "end": 3.1},
+        {"word": "long", "start": 3.2, "end": 3.4},
+        {"word": "sentence", "start": 3.5, "end": 3.9},
+        {"word": "that", "start": 4.0, "end": 4.2},
+        {"word": "should", "start": 4.3, "end": 4.6},
+        {"word": "be", "start": 4.7, "end": 4.8},
+        {"word": "wrapped", "start": 4.9, "end": 5.3},
+        {"word": "into", "start": 5.4, "end": 5.6},
+        {"word": "multiple", "start": 5.7, "end": 6.1},
+        {"word": "lines", "start": 6.2, "end": 6.5},
+        {"word": "for", "start": 6.6, "end": 6.8},
+        {"word": "better", "start": 6.9, "end": 7.2},
+        {"word": "readability.", "start": 7.3, "end": 8.0},
+    ]
+    return words
+
+
 def test_speech_sync_mode():
     """Test speech synchronization mode."""
     print("🎯 Testing Speech Synchronization Mode")
@@ -141,10 +172,80 @@ def test_comparison_modes():
             print(f"  ... and {len(segments) - 5} more segments")
 
 
+def test_overlap_fix():
+    """Test the overlap fixing functionality."""
+    print("\n\n🔧 Testing Overlap Fix & Text Wrapping")
+    print("=" * 50)
+    
+    # Create problematic word timestamps
+    word_timestamps = create_problematic_word_timestamps()
+    print(f"Created {len(word_timestamps)} problematic word timestamps")
+    
+    # Test with speech sync processor
+    processor = SubtitleProcessor(
+        speech_sync_mode=True,
+        min_word_duration_ms=800,  # Force minimum duration that could cause overlaps
+        max_word_duration_ms=2000,
+        max_chars_per_line=40,  # Force text wrapping
+        max_lines=2,
+    )
+    
+    # Process with speech sync
+    segments = processor.process_segments([], word_timestamps=word_timestamps)
+    
+    print(f"\n✅ Generated {len(segments)} fixed segments:")
+    print("-" * 50)
+    
+    # Check for overlaps and display results
+    has_overlaps = False
+    for i, segment in enumerate(segments, 1):
+        duration = segment.duration()
+        
+        # Check for overlap with previous segment
+        overlap_status = ""
+        if i > 1:
+            prev_end = segments[i-2].end_time
+            if segment.start_time < prev_end:
+                overlap_status = " ⚠️ OVERLAP!"
+                has_overlaps = True
+            elif segment.start_time - prev_end < 0.1:
+                overlap_status = f" ✅ Gap: {(segment.start_time - prev_end)*1000:.0f}ms"
+            else:
+                overlap_status = f" ✅ Gap: {(segment.start_time - prev_end)*1000:.0f}ms"
+        
+        # Show if text was wrapped
+        lines = segment.text.split('\n')
+        text_status = f" ({len(lines)} lines)" if len(lines) > 1 else ""
+        
+        print(f"{i:2d}. [{segment.start_time:6.3f}s - {segment.end_time:6.3f}s] "
+              f"({duration:5.2f}s){text_status} '{segment.text.replace(chr(10), ' | ')}'{overlap_status}")
+    
+    if not has_overlaps:
+        print("\n✅ No timing overlaps detected!")
+    else:
+        print("\n❌ Timing overlaps still present!")
+    
+    # Test saving to files
+    with tempfile.TemporaryDirectory() as temp_dir:
+        srt_path, vtt_path = processor.save_subtitles(segments, temp_dir, "overlap_fix_test")
+        
+        print(f"\n📁 Files created:")
+        print(f"   SRT: {srt_path}")
+        
+        # Show first few lines of SRT to see wrapping
+        print(f"\n📝 SRT Content (first 10 lines):")
+        print("-" * 30)
+        with open(srt_path, 'r', encoding='utf-8') as f:
+            lines = f.readlines()[:10]
+            for line in lines:
+                print(line.rstrip())
+
+
 if __name__ == "__main__":
     try:
         test_speech_sync_mode()
         test_comparison_modes()
+        test_overlap_fix()
         print("\n✅ All tests completed successfully!")
         
     except Exception as e:

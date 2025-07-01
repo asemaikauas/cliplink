@@ -11,6 +11,7 @@ from pathlib import Path
 from fastapi import APIRouter, HTTPException, BackgroundTasks, UploadFile, File, Form
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
+from pydub import AudioSegment
 
 from app.services.groq_client import transcribe
 from app.services.subs import convert_groq_to_subtitles
@@ -50,6 +51,61 @@ def _cleanup_files(*file_paths: str) -> None:
                 logger.debug(f"Cleaned up file: {file_path}")
         except Exception as e:
             logger.warning(f"Failed to cleanup file {file_path}: {e}")
+
+
+async def extract_audio_for_transcription(video_path: str, task_id: str) -> str:
+    """Extract audio from video file for Groq transcription.
+    
+    Args:
+        video_path: Path to the input video file
+        task_id: Task ID for logging
+        
+    Returns:
+        Path to the extracted audio file (WAV format)
+        
+    Raises:
+        Exception: If audio extraction fails
+    """
+    try:
+        # Create temporary audio file path
+        temp_audio_path = f"{video_path}_audio_{task_id[:8]}.wav"
+        
+        logger.info(f"🎵 Extracting audio from {video_path} for transcription...")
+        
+        # Load video and extract audio
+        audio = AudioSegment.from_file(video_path)
+        
+        # Convert to standard format for Groq (16kHz, mono, WAV)
+        # Groq works best with these settings for transcription
+        audio = audio.set_frame_rate(16000).set_channels(1)
+        
+        # Export as WAV
+        audio.export(temp_audio_path, format="wav")
+        
+        # Verify file was created
+        if not os.path.exists(temp_audio_path) or os.path.getsize(temp_audio_path) == 0:
+            raise Exception("Audio extraction produced empty file")
+        
+        # Get audio duration for logging
+        duration_s = len(audio) / 1000.0
+        file_size_mb = os.path.getsize(temp_audio_path) / (1024 * 1024)
+        
+        logger.info(f"✅ Audio extracted successfully: {duration_s:.1f}s, {file_size_mb:.1f}MB")
+        logger.debug(f"🎵 Audio file: {temp_audio_path}")
+        
+        return temp_audio_path
+        
+    except Exception as e:
+        logger.error(f"❌ Audio extraction failed for task {task_id}: {str(e)}")
+        
+        # Clean up any partial file
+        if 'temp_audio_path' in locals() and os.path.exists(temp_audio_path):
+            try:
+                os.remove(temp_audio_path)
+            except:
+                pass
+        
+        raise Exception(f"Audio extraction failed: {str(e)}")
 
 
 @router.post("/subtitles", response_model=SubtitleResponse)
@@ -144,13 +200,20 @@ async def create_subtitles(
         
         filename_base = Path(video_file.filename).stem or f"video_{task_id[:8]}"
         
-        # Stage 1: Transcription
+        # Stage 1: Audio Extraction + Transcription
         stage_start = time.time()
         _log_stage(task_id, "transcription_start", upload_elapsed)
         
+        # Extract audio from video file for Groq transcription
+        logger.info(f"🎵 Extracting audio from video for transcription...")
+        audio_file_path = await extract_audio_for_transcription(temp_video_path, task_id)
+        
+        if not audio_file_path or not Path(audio_file_path).exists():
+            raise Exception("Failed to extract audio from video file")
+        
         logger.info(f"🎤 Starting transcription with Groq Whisper large-v3...")
         transcription_result = transcribe(
-            file_path=temp_video_path,
+            file_path=audio_file_path,  # Use extracted audio file
             apply_vad=not disable_vad,  # Invert the disable flag
             task_id=task_id
         )
@@ -159,7 +222,7 @@ async def create_subtitles(
         if len(transcription_result["segments"]) == 0 and not disable_vad:
             logger.info(f"🔄 No segments found with VAD, retrying without VAD filtering...")
             transcription_result = transcribe(
-                file_path=temp_video_path,
+                file_path=audio_file_path,  # Use extracted audio file
                 apply_vad=False,
                 task_id=f"{task_id}_retry"
             )
@@ -167,7 +230,7 @@ async def create_subtitles(
         elif len(transcription_result["segments"]) < 3 and not disable_vad:
             logger.info(f"🔄 Very few segments found with VAD ({len(transcription_result['segments'])}), retrying without VAD filtering...")
             retry_result = transcribe(
-                file_path=temp_video_path,
+                file_path=audio_file_path,  # Use extracted audio file
                 apply_vad=False,
                 task_id=f"{task_id}_retry_few"
             )
@@ -175,6 +238,14 @@ async def create_subtitles(
             if len(retry_result["segments"]) > len(transcription_result["segments"]):
                 logger.info(f"✅ Better result without VAD: {len(retry_result['segments'])} vs {len(transcription_result['segments'])} segments")
                 transcription_result = retry_result
+        
+        # Clean up extracted audio file
+        try:
+            if audio_file_path and Path(audio_file_path).exists():
+                os.remove(audio_file_path)
+                logger.debug(f"🧹 Cleaned up temporary audio file: {audio_file_path}")
+        except Exception as e:
+            logger.warning(f"Failed to clean up audio file {audio_file_path}: {e}")
         
         stage_elapsed = int((time.time() - stage_start) * 1000)
         _log_stage(task_id, "transcription_complete", stage_elapsed)
