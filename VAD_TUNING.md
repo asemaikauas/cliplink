@@ -79,9 +79,9 @@ SUBTITLE_MERGE_GAP_MS=200        # Default: 200ms gap merging
 
 # CapCut-Style Punch Words (NEW: default mode)
 SUBTITLE_CAPCUT_MODE=true        # Enable CapCut-style 1-3 word chunks
-CAPCUT_MIN_WORD_DURATION_MS=600  # Minimum display time per word chunk
-CAPCUT_MAX_WORD_DURATION_MS=1200 # Maximum display time per word chunk  
-CAPCUT_WORD_OVERLAP_MS=200       # Overlap between chunks for smooth flow
+CAPCUT_MIN_WORD_DURATION_MS=800  # Minimum display time per word chunk (800ms = better readability)
+CAPCUT_MAX_WORD_DURATION_MS=1500 # Maximum display time per word chunk (1500ms = smoother flow)
+CAPCUT_WORD_OVERLAP_MS=150       # Overlap between chunks for smooth flow (150ms = cleaner transitions)
 
 # Example: Very conservative settings for quiet speech
 # VAD_SILENCE_THRESHOLD=-65
@@ -99,13 +99,14 @@ CAPCUT_WORD_OVERLAP_MS=200       # Overlap between chunks for smooth flow
 
 ### **CapCut Mode (Default)** - Punch Words
 ```
-[1] 00:00.000 --> 00:00.800  "you know"
-[2] 00:00.600 --> 00:01.400  "an agent"  
-[3] 00:01.200 --> 00:02.000  "a chat tool"
-[4] 00:01.800 --> 00:02.600  "on the side"
+[1] 00:00.000 --> 00:00.850  "you know an"
+[2] 00:00.700 --> 00:01.600  "agent, a chat"  
+[3] 00:01.450 --> 00:02.450  "tool on the"
+[4] 00:02.300 --> 00:03.300  "side to say"
+[5] 00:03.150 --> 00:04.150  "hey, you know"
 ```
 ✅ **Perfect for**: Social media, short clips, viral content  
-✅ **Features**: Large fonts, rapid-fire words, overlapping timing  
+✅ **Features**: Millisecond precision, 2-3 words per chunk, overlapping timing  
 
 ### **Traditional Mode** - Full Sentences  
 ```

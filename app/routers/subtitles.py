@@ -193,9 +193,9 @@ async def create_subtitles(
         
         # CapCut-style parameters
         capcut_mode = os.getenv("SUBTITLE_CAPCUT_MODE", "true").lower() == "true"
-        min_word_duration = int(os.getenv("CAPCUT_MIN_WORD_DURATION_MS", 600))
-        max_word_duration = int(os.getenv("CAPCUT_MAX_WORD_DURATION_MS", 1200))
-        word_overlap = int(os.getenv("CAPCUT_WORD_OVERLAP_MS", 200))
+        min_word_duration = int(os.getenv("CAPCUT_MIN_WORD_DURATION_MS", 800))  # Increased for readability
+        max_word_duration = int(os.getenv("CAPCUT_MAX_WORD_DURATION_MS", 1500))  # Increased for better flow
+        word_overlap = int(os.getenv("CAPCUT_WORD_OVERLAP_MS", 150))  # Reduced overlap for clarity
         
         mode_name = "CapCut punch-word" if capcut_mode else "Traditional"
         logger.info(f"🎬 Subtitle mode: {mode_name} style")

@@ -34,9 +34,9 @@ class SubtitleProcessor:
         max_lines: int = 2,  # Legacy parameter - not used in CapCut mode  
         merge_gap_threshold_ms: int = 200,
         capcut_mode: bool = True,  # Enable CapCut-style punch words
-        min_word_duration_ms: int = 600,  # Minimum display time per word chunk
-        max_word_duration_ms: int = 1200,  # Maximum display time per word chunk
-        word_overlap_ms: int = 200  # Overlap between word chunks for smooth flow
+        min_word_duration_ms: int = 800,  # Minimum display time per word chunk
+        max_word_duration_ms: int = 1500,  # Maximum display time per word chunk
+        word_overlap_ms: int = 150  # Overlap between word chunks for smooth flow
     ):
         """Initialize subtitle processor.
         
@@ -187,54 +187,72 @@ class SubtitleProcessor:
         
         logger.debug(f"CapCut chunking: '{text}' -> {len(chunks)} chunks: {chunks}")
         
-        # Calculate timing for each chunk
+        # Calculate timing for each chunk with millisecond precision
         segments = []
-        overlap_s = self.word_overlap_ms / 1000.0
-        min_duration_s = self.min_word_duration_ms / 1000.0
-        max_duration_s = self.max_word_duration_ms / 1000.0
+        overlap_ms = self.word_overlap_ms
+        min_duration_ms = self.min_word_duration_ms
+        max_duration_ms = self.max_word_duration_ms
         
-        # Calculate base duration per chunk
         if len(chunks) == 1:
-            # Single chunk gets full duration
-            chunk_duration = min(max_duration_s, duration_s)
-            chunk_start = start_time
-            chunk_end = start_time + chunk_duration
+            # Single chunk gets full duration, capped at max
+            chunk_duration_ms = min(max_duration_ms, duration_ms)
+            chunk_start_ms = start_time * 1000
+            chunk_end_ms = chunk_start_ms + chunk_duration_ms
+            
+            segments.append(SubtitleSegment(
+                start_time=chunk_start_ms / 1000.0,
+                end_time=chunk_end_ms / 1000.0,
+                text=chunks[0]
+            ))
         else:
-            # Multiple chunks with overlap
-            # Total time available for chunks (including overlaps)
-            total_available_time = duration_s + (len(chunks) - 1) * overlap_s
-            base_duration_per_chunk = total_available_time / len(chunks)
+            # Multiple chunks with precise millisecond timing
+            # Calculate how much time each chunk should get
+            total_duration_ms = duration_ms
             
-            # Ensure duration is within bounds
-            base_duration_per_chunk = max(min_duration_s, min(max_duration_s, base_duration_per_chunk))
+            # Distribute time: each chunk gets minimum duration, rest is distributed
+            total_min_time = len(chunks) * min_duration_ms
+            extra_time = max(0, total_duration_ms - total_min_time)
             
-            current_start = start_time
-            for i, chunk_text in enumerate(chunks):
-                chunk_start = current_start
-                chunk_end = chunk_start + base_duration_per_chunk
+            # Distribute extra time proportionally based on word count
+            chunk_word_counts = [len(chunk.split()) for chunk in chunks]
+            total_words = sum(chunk_word_counts)
+            
+            current_start_ms = start_time * 1000
+            
+            for i, (chunk_text, word_count) in enumerate(zip(chunks, chunk_word_counts)):
+                # Base duration + proportional extra time
+                if total_words > 0:
+                    word_proportion = word_count / total_words
+                    chunk_extra_time = extra_time * word_proportion
+                else:
+                    chunk_extra_time = extra_time / len(chunks)
                 
-                # Ensure last chunk doesn't exceed original end time by too much
+                chunk_duration_ms = min_duration_ms + chunk_extra_time
+                
+                # Cap at maximum duration
+                chunk_duration_ms = min(chunk_duration_ms, max_duration_ms)
+                
+                chunk_start_ms = current_start_ms
+                chunk_end_ms = chunk_start_ms + chunk_duration_ms
+                
+                # Ensure last chunk doesn't exceed original end too much
                 if i == len(chunks) - 1:
-                    chunk_end = min(chunk_end, end_time + 0.5)  # Allow 500ms overshoot for last chunk
+                    max_allowed_end_ms = (end_time + 0.5) * 1000  # Allow 500ms overshoot
+                    chunk_end_ms = min(chunk_end_ms, max_allowed_end_ms)
                 
                 segments.append(SubtitleSegment(
-                    start_time=chunk_start,
-                    end_time=chunk_end,
+                    start_time=chunk_start_ms / 1000.0,
+                    end_time=chunk_end_ms / 1000.0,
                     text=chunk_text
                 ))
                 
                 # Next chunk starts with overlap
-                current_start = chunk_start + base_duration_per_chunk - overlap_s
+                current_start_ms = chunk_start_ms + chunk_duration_ms - overlap_ms
+                
+                # Ensure we don't go negative
+                current_start_ms = max(current_start_ms, chunk_start_ms + 50)  # Min 50ms gap
         
-        # Handle single chunk case
-        if len(chunks) == 1:
-            segments.append(SubtitleSegment(
-                start_time=chunk_start,
-                end_time=chunk_end,
-                text=chunks[0]
-            ))
-        
-        logger.debug(f"CapCut timing: {len(segments)} segments with {overlap_s*1000:.0f}ms overlaps")
+        logger.debug(f"CapCut timing: {len(segments)} segments with {overlap_ms:.0f}ms overlaps")
         
         return segments
     
@@ -561,9 +579,9 @@ def convert_groq_to_subtitles(
     max_lines: int = 2,  # Legacy parameter
     merge_gap_threshold_ms: int = 200,
     capcut_mode: bool = True,  # Enable CapCut-style punch words by default
-    min_word_duration_ms: int = 600,  # CapCut: Min display time per word chunk
-    max_word_duration_ms: int = 1200,  # CapCut: Max display time per word chunk
-    word_overlap_ms: int = 200  # CapCut: Overlap between word chunks
+    min_word_duration_ms: int = 800,  # CapCut: Min display time per word chunk
+    max_word_duration_ms: int = 1500,  # CapCut: Max display time per word chunk
+    word_overlap_ms: int = 150  # CapCut: Overlap between word chunks
 ) -> Tuple[str, str]:
     """Convenience function to convert Groq segments to subtitle files.
     

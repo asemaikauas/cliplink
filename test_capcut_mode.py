@@ -16,9 +16,9 @@ def test_capcut_mode():
     # Create processor in CapCut mode
     processor = SubtitleProcessor(
         capcut_mode=True,
-        min_word_duration_ms=600,
-        max_word_duration_ms=1200,
-        word_overlap_ms=200
+        min_word_duration_ms=800,
+        max_word_duration_ms=1500,
+        word_overlap_ms=150
     )
     
     # Test data similar to your example
