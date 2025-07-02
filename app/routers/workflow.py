@@ -24,6 +24,10 @@ from app.services.vertical_crop_async import (
     crop_video_to_vertical_async,
     async_vertical_crop_service
 )
+# Add imports for subtitle processing
+from app.services.subs import convert_groq_to_subtitles
+from app.services.burn_in import burn_subtitles_to_video
+from app.services.groq_client import transcribe
 
 router = APIRouter()
 
@@ -80,10 +84,25 @@ class AsyncProcessVideoRequest(BaseModel):
     priority: Optional[str] = "normal"  # low, normal, high
     notify_webhook: Optional[str] = None  # Optional webhook URL for completion notification
 
+class ComprehensiveWorkflowRequest(BaseModel):
+    """Request for comprehensive workflow: transcript → gemini → download → vertical crop → burn subtitles with speech sync"""
+    youtube_url: str
+    quality: Optional[str] = "best"  # best, 8k, 4k, 1440p, 1080p, 720p
+    create_vertical: Optional[bool] = True  # Create vertical (9:16) clips (default True for comprehensive workflow)
+    smoothing_strength: Optional[str] = "very_high"  # low, medium, high, very_high
+    burn_subtitles: Optional[bool] = True  # Whether to burn subtitles into videos (always uses speech synchronization)
+    font_size: Optional[int] = 15  # Font size for subtitles (12-120)
+    export_codec: Optional[str] = "h264"  # Video codec (h264, h265)
+    priority: Optional[str] = "normal"  # low, normal, high
+    notify_webhook: Optional[str] = None  # Optional webhook URL for completion notification
+
 async def _run_blocking_task(func, *args, **kwargs):
     """Run blocking functions in thread pool"""
     loop = asyncio.get_event_loop()
-    return await loop.run_in_executor(workflow_executor, func, *args, **kwargs)
+    # Create a wrapper function that handles keyword arguments
+    def wrapper():
+        return func(*args, **kwargs)
+    return await loop.run_in_executor(workflow_executor, wrapper)
 
 def _update_workflow_progress(task_id: str, step: str, progress: int, message: str, data: Optional[Dict] = None):
     """Update workflow task progress with thread safety"""
@@ -103,13 +122,26 @@ async def _process_video_workflow_async(
     youtube_url: str,
     quality: str,
     create_vertical: bool,
-    smoothing_strength: str
+    smoothing_strength: str,
+    burn_subtitles: bool = False,
+    font_size: int = 15,
+    export_codec: str = "h264"
 ):
     """
     Async implementation of the complete video processing workflow
     """
     try:
-        _update_workflow_progress(task_id, "init", 5, f"Starting workflow for: {youtube_url}")
+        print(f"🚀 Starting comprehensive workflow with settings:")
+        print(f"   📺 URL: {youtube_url}")
+        print(f"   📹 Quality: {quality}")
+        print(f"   📱 Create vertical: {create_vertical}")
+        print(f"   🔥 Burn subtitles: {burn_subtitles}")
+        print(f"   🎨 Font size: {font_size}px")
+        print(f"   🎯 Speech synchronization: ENABLED (word-level timestamps)")
+        print(f"   🎛️ VAD filtering: ENABLED (with retry logic)")
+        print(f"   🎬 Export codec: {export_codec}")
+        
+        _update_workflow_progress(task_id, "init", 5, f"Starting comprehensive workflow for: {youtube_url}")
         
         # Step 1: Get video info (5-10%)
         _update_workflow_progress(task_id, "video_info", 5, "Getting video information...")
@@ -169,41 +201,309 @@ async def _process_video_workflow_async(
         except DownloadError as e:
             raise Exception(f"Download failed: {str(e)}")
         
-        # Step 5: Cut clips (60-95%)
-        _update_workflow_progress(task_id, "cutting", 60, "Cutting video into clips...")
+        # Step 5: Cut clips with vertical cropping (60-75%)
+        _update_workflow_progress(task_id, "cutting", 60, "✂️ Cutting and processing video clips...")
         
         try:
             if create_vertical:
-                _update_workflow_progress(task_id, "cutting", 65, f"Creating vertical clips with {smoothing_strength} smoothing...")
-                clip_paths = await cut_clips_vertical_async(
-                    video_path, 
-                    gemini_analysis, 
-                    smoothing_strength
-                )
+                _update_workflow_progress(task_id, "cutting", 62, f"Creating vertical clips directly with {smoothing_strength} smoothing...")
+                
+                # Use the more efficient vertical cutting approach that combines cutting and cropping
+                from app.services.vertical_crop_async import crop_video_to_vertical_async
+                
+                # Process each viral segment directly to vertical clips
+                clip_paths = []
+                
+                for i, segment in enumerate(viral_segments):
+                    progress = 62 + (i / len(viral_segments)) * 13  # 62-75%
+                    _update_workflow_progress(
+                        task_id, "cutting", int(progress), 
+                        f"Creating vertical clip {i+1}/{len(viral_segments)}: {segment.get('title', f'Segment {i+1}')}"
+                    )
+                    
+                    start_time = segment.get("start")
+                    end_time = segment.get("end")
+                    title = segment.get("title", f"Segment_{i+1}")
+                    
+                    if start_time is None or end_time is None:
+                        continue
+                    
+                    # Create safe filename
+                    from app.services.youtube import _sanitize_filename
+                    safe_title = _sanitize_filename(title)
+                    
+                    # Create output directory
+                    clips_dir = video_path.parent / "clips" / "vertical"
+                    clips_dir.mkdir(parents=True, exist_ok=True)
+                    
+                    # Create temporary segment first
+                    temp_segment_path = clips_dir / f"temp_{safe_title}_{i+1}.mp4"
+                    
+                    # Cut the segment using direct ffmpeg
+                    from app.services.youtube import create_clip_with_direct_ffmpeg
+                    if not create_clip_with_direct_ffmpeg(video_path, start_time, end_time, temp_segment_path):
+                        print(f"⚠️ Failed to cut segment {i+1}: {title}")
+                        continue
+                    
+                    # Apply vertical cropping to this segment
+                    vertical_clip_path = clips_dir / f"{safe_title}_vertical.mp4"
+                    
+                    try:
+                        crop_result = await crop_video_to_vertical_async(
+                            input_path=temp_segment_path,
+                            output_path=vertical_clip_path,
+                            use_speaker_detection=True,
+                            use_smart_scene_detection=True,
+                            smoothing_strength=smoothing_strength
+                        )
+                        
+                        if crop_result.get("success") and vertical_clip_path.exists():
+                            clip_paths.append(vertical_clip_path)
+                            print(f"✅ Vertical clip created: {vertical_clip_path.name}")
+                        else:
+                            print(f"⚠️ Failed to create vertical clip for segment {i+1}")
+                    except Exception as e:
+                        print(f"❌ Error creating vertical clip {i+1}: {str(e)}")
+                    finally:
+                        # Clean up temporary segment immediately
+                        if temp_segment_path.exists():
+                            temp_segment_path.unlink()
+                
             else:
-                _update_workflow_progress(task_id, "cutting", 65, "Creating standard horizontal clips...")
+                _update_workflow_progress(task_id, "cutting", 62, "Creating standard horizontal clips...")
                 clip_paths = await _run_blocking_task(cut_clips, video_path, gemini_analysis)
             
             _update_workflow_progress(
-                task_id, "cutting", 95, 
-                f"Clips created: {len(clip_paths)} files",
+                task_id, "cutting", 75, 
+                f"✅ Clips created: {len(clip_paths)} files",
                 {"clip_paths": [str(p) for p in clip_paths]}
             )
         except Exception as e:
             raise Exception(f"Clip cutting failed: {str(e)}")
         
-        # Step 6: Finalize (95-100%)
-        _update_workflow_progress(task_id, "finalizing", 95, "Finalizing results...")
+        # Step 6 & 7: Generate subtitles and burn them per clip (75-95%) - if enabled
+        subtitled_clips = clip_paths  # Default to original clips
+        
+        if burn_subtitles:
+            print(f"📝 Subtitle generation ENABLED - generating subtitles for {len(clip_paths)} individual clips...")
+            _update_workflow_progress(task_id, "per_clip_subtitles", 75, "📝 Generating subtitles for each clip individually...")
+            
+            try:
+                subtitled_clips = []
+                total_subtitle_segments = 0
+                
+                for i, clip_path in enumerate(clip_paths):
+                    # Progress: 75% + (i/clips * 20%) = 75-95%
+                    base_progress = 75 + (i / len(clip_paths)) * 20
+                    
+                    _update_workflow_progress(
+                        task_id, "per_clip_subtitles", int(base_progress), 
+                        f"📝 Processing clip {i+1}/{len(clip_paths)}: {clip_path.name}"
+                    )
+                    
+                    try:
+                        # Step 6a: Generate subtitles for this specific clip
+                        print(f"📝 Generating subtitles for clip: {clip_path.name}")
+                        
+                        # Extract audio from this clip (same logic as /subtitles endpoint)
+                        from pydub import AudioSegment
+                        temp_audio_path = f"temp_clip_audio_{task_id[:8]}_{i}.wav"
+                        
+                        print(f"🎵 Extracting audio from clip {i+1} for transcription...")
+                        audio = AudioSegment.from_file(str(clip_path))
+                        # Convert to standard format for Groq (16kHz, mono, WAV)
+                        audio = audio.set_frame_rate(16000).set_channels(1)
+                        audio.export(temp_audio_path, format="wav")
+                        
+                        # Get audio duration for logging
+                        duration_s = len(audio) / 1000.0
+                        print(f"✅ Audio extracted: {duration_s:.1f}s")
+                        
+                        # Transcribe this clip's audio with VAD enabled and retry logic
+                        print(f"🎤 Starting transcription with Groq Whisper large-v3 (VAD enabled)...")
+                        
+                        transcription_result = await _run_blocking_task(
+                            transcribe,
+                            file_path=temp_audio_path,
+                            apply_vad=True,  # VAD enabled for better quality
+                            task_id=f"{task_id}_clip_{i}"
+                        )
+                        
+                        # Retry logic from /subtitles endpoint for better results
+                        if len(transcription_result["segments"]) == 0:
+                            print(f"🔄 No segments found with VAD for clip {i+1}, retrying without VAD...")
+                            transcription_result = await _run_blocking_task(
+                                transcribe,
+                                file_path=temp_audio_path,
+                                apply_vad=False,
+                                task_id=f"{task_id}_clip_{i}_retry"
+                            )
+                        elif len(transcription_result["segments"]) < 3:
+                            print(f"🔄 Few segments with VAD for clip {i+1} ({len(transcription_result['segments'])}), trying without VAD...")
+                            retry_result = await _run_blocking_task(
+                                transcribe,
+                                file_path=temp_audio_path,
+                                apply_vad=False,
+                                task_id=f"{task_id}_clip_{i}_retry_few"
+                            )
+                            # Use the result with more segments
+                            if len(retry_result["segments"]) > len(transcription_result["segments"]):
+                                print(f"✅ Better result without VAD: {len(retry_result['segments'])} vs {len(transcription_result['segments'])} segments")
+                                transcription_result = retry_result
+                        
+                        # Clean up temp audio
+                        if Path(temp_audio_path).exists():
+                            Path(temp_audio_path).unlink()
+                        
+                        if not transcription_result or not transcription_result.get("segments"):
+                            print(f"⚠️ No transcription segments for clip {i+1}, skipping subtitles")
+                            subtitled_clips.append(clip_path)
+                            continue
+                        
+                        print(f"✅ Transcription complete: {len(transcription_result['segments'])} segments, language: {transcription_result['language']}")
+                        
+                        # Generate subtitle files for this clip (same logic as /subtitles endpoint)
+                        clip_subtitle_dir = clip_path.parent / "subtitles"
+                        clip_subtitle_dir.mkdir(exist_ok=True)
+                        
+                        print(f"📝 Generating SRT and VTT subtitle files for clip {i+1}...")
+                        
+                        # Configure subtitle processing parameters (same as /subtitles endpoint)
+                        import os
+                        max_chars_per_line = int(os.getenv("SUBTITLE_MAX_CHARS_PER_LINE", 50))
+                        max_lines = int(os.getenv("SUBTITLE_MAX_LINES", 2))
+                        merge_gap_threshold = int(os.getenv("SUBTITLE_MERGE_GAP_MS", 200))
+                        
+                        # CapCut-style parameters from environment
+                        capcut_mode = os.getenv("SUBTITLE_CAPCUT_MODE", "true").lower() == "true"
+                        min_word_duration = int(os.getenv("CAPCUT_MIN_WORD_DURATION_MS", 800))
+                        max_word_duration = int(os.getenv("CAPCUT_MAX_WORD_DURATION_MS", 1500))
+                        word_overlap = int(os.getenv("CAPCUT_WORD_OVERLAP_MS", 150))
+                        
+                        # ENABLE SPEECH SYNC BY DEFAULT (key feature!)
+                        speech_sync = True  # Always enable word-level timestamps for best quality
+                        
+                        # Determine subtitle mode with speech sync priority
+                        if speech_sync:
+                            mode_name = "Speech-synchronized"
+                            actual_capcut_mode = False  # Speech sync takes priority
+                        elif capcut_mode:
+                            mode_name = "CapCut adaptive-word"
+                            actual_capcut_mode = True
+                        else:
+                            mode_name = "Traditional"
+                            actual_capcut_mode = False
+                        
+                        print(f"🎬 Subtitle mode for clip {i+1}: {mode_name} style")
+                        
+                        # Get word timestamps for speech sync
+                        word_timestamps = transcription_result.get("word_timestamps", []) if speech_sync else None
+                        if speech_sync and word_timestamps:
+                            print(f"🎯 Using {len(word_timestamps)} word timestamps for speech sync")
+                        elif speech_sync:
+                            print(f"⚠️ Speech sync requested but no word timestamps available for clip {i+1}, falling back to CapCut mode")
+                            actual_capcut_mode = True
+                        
+                        clip_srt_path, clip_vtt_path = await _run_blocking_task(
+                            convert_groq_to_subtitles,
+                            groq_segments=transcription_result["segments"],
+                            output_dir=str(clip_subtitle_dir),
+                            filename_base=f"clip_{i+1}_{clip_path.stem}",
+                            max_chars_per_line=max_chars_per_line,
+                            max_lines=max_lines,
+                            merge_gap_threshold_ms=merge_gap_threshold,
+                            capcut_mode=actual_capcut_mode,
+                            speech_sync_mode=speech_sync,
+                            word_timestamps=word_timestamps,
+                            min_word_duration_ms=min_word_duration,
+                            max_word_duration_ms=max_word_duration,
+                            word_overlap_ms=word_overlap
+                        )
+                        
+                        if not clip_srt_path or not Path(clip_srt_path).exists():
+                            print(f"⚠️ Failed to generate SRT for clip {i+1}, using original clip")
+                            subtitled_clips.append(clip_path)
+                            continue
+                        
+                        print(f"✅ Subtitles generated for clip {i+1}: {len(transcription_result['segments'])} segments")
+                        total_subtitle_segments += len(transcription_result["segments"])
+                        
+                        # Step 6b: Burn subtitles into this clip
+                        print(f"🔥 Burning subtitles into clip {i+1}...")
+                        
+                        # Create output path for subtitled clip
+                        subtitled_path = clip_path.parent / f"subtitled_{clip_path.name}"
+                        
+                        # Burn clip-specific subtitles
+                        await _run_blocking_task(
+                            burn_subtitles_to_video,
+                            video_path=str(clip_path),
+                            srt_path=clip_srt_path,
+                            output_path=str(subtitled_path),
+                            font_size=font_size,
+                            export_codec=export_codec,
+                            task_id=f"{task_id}_burn_{i}"
+                        )
+                        
+                        if subtitled_path.exists():
+                            subtitled_clips.append(subtitled_path)
+                            print(f"✅ Subtitled clip created: {subtitled_path.name}")
+                        else:
+                            print(f"⚠️ Failed to create subtitled clip: {subtitled_path}")
+                            # Fall back to original clip if subtitle burning fails
+                            subtitled_clips.append(clip_path)
+                            
+                    except Exception as e:
+                        print(f"⚠️ Failed to process subtitles for clip {i+1}: {str(e)}")
+                        # Fall back to original clip if anything fails
+                        subtitled_clips.append(clip_path)
+                        continue
+                
+                subtitled_count = len([p for p in subtitled_clips if 'subtitled_' in str(p)])
+                _update_workflow_progress(
+                    task_id, "per_clip_subtitles", 95, 
+                    f"✅ Per-clip subtitle processing complete: {subtitled_count}/{len(clip_paths)} clips with subtitles",
+                    {
+                        "subtitled_clips": [str(p) for p in subtitled_clips],
+                        "total_subtitle_segments": total_subtitle_segments
+                    }
+                )
+                
+                print(f"✅ Per-clip subtitle processing completed successfully!")
+                print(f"   🎬 Clips processed: {len(clip_paths)}")
+                print(f"   🔥 Subtitled clips created: {subtitled_count}")
+                print(f"   📝 Total subtitle segments: {total_subtitle_segments}")
+                
+            except Exception as e:
+                # If subtitle processing fails, continue with original clips
+                print(f"⚠️ Per-clip subtitle processing failed: {str(e)}")
+                import traceback
+                print(f"🔍 Full per-clip subtitle error traceback: {traceback.format_exc()}")
+                subtitled_clips = clip_paths
+                _update_workflow_progress(
+                    task_id, "per_clip_subtitles", 95, 
+                    f"❌ Per-clip subtitle processing failed, using original clips: {str(e)}",
+                    {"subtitled_clips": [str(p) for p in clip_paths]}
+                )
+        else:
+            _update_workflow_progress(task_id, "per_clip_subtitles", 95, "Skipping per-clip subtitle generation (disabled)")
+        
+        # Step 8: Finalize (95-100%)
+        _update_workflow_progress(task_id, "finalizing", 95, "Finalizing comprehensive workflow results...")
         
         # Prepare final result
+        subtitled_count = len([p for p in subtitled_clips if 'subtitled_' in str(p)])
         result = {
             "success": True,
+            "workflow_type": "comprehensive",
             "workflow_steps": {
                 "video_info_extraction": True,
                 "transcript_extraction": True,
                 "gemini_analysis": True, 
                 "video_download": True,
-                "clip_cutting": True
+                "subtitle_generation": burn_subtitles and subtitled_count > 0,
+                "clip_cutting": True,
+                "subtitle_burning": burn_subtitles and subtitled_count > 0
             },
             "video_info": {
                 "id": video_info['id'],
@@ -233,21 +533,42 @@ async def _process_video_workflow_async(
                     for seg in viral_segments
                 ]
             },
+            "subtitle_info": {
+                "subtitle_style": "speech_synchronized" if burn_subtitles else None,  # Always use speech sync
+                "subtitle_approach": "per_clip_generation_with_word_timestamps" if burn_subtitles else None,
+                "speech_synchronization": True if burn_subtitles else None,
+                "vad_filtering": True if burn_subtitles else None,
+                "clips_with_subtitles": subtitled_count,
+                "total_clips": len(clip_paths),
+                "subtitle_success_rate": f"{(subtitled_count/len(clip_paths)*100):.1f}%" if len(clip_paths) > 0 else "0%",
+                "font_size": font_size if burn_subtitles else None,
+                "export_codec": export_codec if burn_subtitles else None
+            } if burn_subtitles else None,
             "files_created": {
                 "source_video": str(video_path),
                 "clips_created": len(clip_paths),
-                "clip_paths": [str(p) for p in clip_paths],
+                "original_clip_paths": [str(p) for p in clip_paths],
+                "subtitled_clips_created": subtitled_count,
+                "final_clip_paths": [str(p) for p in subtitled_clips],
                 "clip_type": "vertical" if create_vertical else "horizontal",
-                "resolution": "native" if create_vertical else "original"
+                "has_subtitles": burn_subtitles and subtitled_count > 0,
+                "subtitle_files_location": str(clip_paths[0].parent / "subtitles") if len(clip_paths) > 0 and burn_subtitles else None
             }
         }
         
         # Mark as completed
         with workflow_task_lock:
+            if burn_subtitles and subtitled_count > 0:
+                message = f"Comprehensive workflow completed! {len(viral_segments)} segments → {len(clip_paths)} clips → {subtitled_count} clips with subtitles"
+            elif burn_subtitles:
+                message = f"Workflow completed! {len(viral_segments)} segments → {len(clip_paths)} clips (subtitle processing failed)"
+            else:
+                message = f"Workflow completed! {len(viral_segments)} segments → {len(clip_paths)} clips"
+            
             workflow_tasks[task_id].update({
                 "status": "completed",
                 "progress": 100,
-                "message": f"Workflow completed successfully! {len(viral_segments)} segments → {len(clip_paths)} clips",
+                "message": message,
                 "result": result,
                 "completed_at": datetime.now()
             })
@@ -260,25 +581,41 @@ async def _process_video_workflow_async(
             workflow_tasks[task_id].update({
                 "status": "failed",
                 "error": str(e),
-                "message": f"Workflow failed: {str(e)}",
+                "message": f"Comprehensive workflow failed: {str(e)}",
                 "completed_at": datetime.now()
             })
-        raise e
+        raise e 
 
-@router.post("/process-complete-async")
-async def process_video_complete_async(request: AsyncProcessVideoRequest):
+@router.post("/process-comprehensive-async")
+async def process_comprehensive_workflow_async(request: ComprehensiveWorkflowRequest):
     """
-    Async complete video processing workflow with progress tracking:
-    1. Extract transcript from YouTube URL
-    2. Analyze with Gemini AI to find viral segments  
-    3. Download video in specified quality (supports up to 8K)
-    4. Cut video into segments based on Gemini analysis
+    🚀 COMPREHENSIVE async workflow that combines EVERYTHING:
     
-    Returns immediately with task_id for status polling
+    1. 📄 Extract transcript from YouTube URL
+    2. 🤖 Analyze with Gemini AI to find viral segments  
+    3. 📥 Download video in specified quality (supports up to 8K)
+    4. ✂️ Cut video into segments based on Gemini analysis with vertical cropping
+    5. 📝 Generate subtitles with TRUE SPEECH SYNCHRONIZATION (word-level timestamps)
+    6. 🔥 Burn subtitles directly into the final clips with perfect timing
+    
+    🎯 ADVANCED SUBTITLE FEATURES:
+    - Word-level timestamp synchronization for perfect speech alignment
+    - VAD filtering with intelligent retry logic
+    - Environment-configurable parameters
+    - Multiple fallback strategies for maximum reliability
+    
+    This is the ultimate all-in-one endpoint that takes a YouTube URL and produces 
+    ready-to-upload short clips with professional-quality burned-in subtitles!
+    
+    Returns immediately with task_id for status polling.
     """
     try:
         # Generate unique task ID
-        task_id = f"workflow_{uuid.uuid4().hex[:8]}"
+        task_id = f"comprehensive_{uuid.uuid4().hex[:8]}"
+        
+        # Validate font size
+        if request.font_size and (request.font_size < 12 or request.font_size > 120):
+            raise HTTPException(status_code=400, detail="Font size must be between 12 and 120")
         
         # Initialize task tracking
         with workflow_task_lock:
@@ -291,860 +628,66 @@ async def process_video_complete_async(request: AsyncProcessVideoRequest):
                 "quality": request.quality or "best",
                 "create_vertical": request.create_vertical,
                 "smoothing_strength": request.smoothing_strength,
+                "burn_subtitles": request.burn_subtitles,
+                "font_size": request.font_size,
+                "export_codec": request.export_codec,
+                "speech_synchronization": True,  # Always enabled
+                "vad_filtering": True,  # Always enabled
                 "priority": request.priority or "normal",
                 "notify_webhook": request.notify_webhook,
                 "current_step": "queued",
-                "message": "Workflow queued for processing",
-                "error": None
+                "message": "Comprehensive workflow queued for processing",
+                "error": None,
+                "workflow_type": "comprehensive"
             }
         
-        print(f"🚀 Async workflow {task_id} queued: {request.youtube_url}")
-        print(f"🎯 Settings: quality={request.quality}, vertical={request.create_vertical}, smoothing={request.smoothing_strength}")
+        print(f"🚀 Comprehensive workflow {task_id} queued: {request.youtube_url}")
+        print(f"🎯 Settings: quality={request.quality}, vertical={request.create_vertical}, subtitles={request.burn_subtitles}")
+        print(f"🎬 Subtitle settings: speech_sync=True, vad_filtering=True, size={request.font_size}px, codec={request.export_codec}")
         
         # Start async processing (don't await - let it run in background)
+        # Note: Using the optimized workflow function with speech synchronization
         asyncio.create_task(_process_video_workflow_async(
             task_id,
             request.youtube_url,
             request.quality or "best",
-            request.create_vertical or False,
-            request.smoothing_strength or "very_high"
+            request.create_vertical or True,
+            request.smoothing_strength or "very_high",
+            request.burn_subtitles or False,
+            request.font_size or 15,
+            request.export_codec or "h264"
         ))
         
         return {
             "success": True,
             "task_id": task_id,
-            "message": "Complete video processing workflow started",
+            "message": "🎬 Comprehensive workflow started! This will create clips with burned-in subtitles.",
             "youtube_url": request.youtube_url,
+            "workflow_type": "comprehensive",
             "settings": {
                 "quality": request.quality or "best",
-                "create_vertical": request.create_vertical or False,
-                "smoothing_strength": request.smoothing_strength or "very_high"
+                "create_vertical": request.create_vertical or True,
+                "smoothing_strength": request.smoothing_strength or "very_high",
+                "burn_subtitles": request.burn_subtitles or True,
+                "speech_synchronization": True,
+                "vad_filtering": True,
+                "font_size": request.font_size or 15,
+                "export_codec": request.export_codec or "h264"
             },
+            "workflow_steps": [
+                "1. Video info extraction",
+                "2. Transcript extraction", 
+                "3. Gemini AI analysis",
+                "4. Video download",
+                "5. Vertical clip cutting",
+                "6. Per-clip speech-synchronized subtitle generation",
+                "7. Professional subtitle burning with word-level timing",
+                "8. Final processing"
+            ],
             "status_endpoint": f"/workflow/workflow-status/{task_id}",
-            "estimated_time": "5-20 minutes depending on video length and quality"
+            "estimated_time": "10-30 minutes depending on video length and quality"
         }
         
     except Exception as e:
-        print(f"❌ Failed to start async workflow: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"Failed to start workflow: {str(e)}")
-
-@router.get("/workflow-status/{task_id}")
-async def get_workflow_status(task_id: str):
-    """
-    Get the status and progress of a complete workflow task
-    """
-    with workflow_task_lock:
-        task = workflow_tasks.get(task_id)
-    
-    if not task:
-        raise HTTPException(status_code=404, detail=f"Workflow task {task_id} not found")
-    
-    # Calculate processing time
-    created_at = task.get("created_at")
-    updated_at = task.get("updated_at", created_at)
-    completed_at = task.get("completed_at")
-    
-    response = {
-        "task_id": task_id,
-        "status": task["status"],
-        "progress": task["progress"],
-        "current_step": task["current_step"],
-        "message": task["message"],
-        "youtube_url": task["youtube_url"],
-        "settings": {
-            "quality": task["quality"],
-            "create_vertical": task["create_vertical"],
-            "smoothing_strength": task["smoothing_strength"]
-        },
-        "created_at": created_at.isoformat() if created_at else None,
-        "updated_at": updated_at.isoformat() if updated_at else None,
-    }
-    
-    if completed_at:
-        response["completed_at"] = completed_at.isoformat()
-        processing_time = (completed_at - created_at).total_seconds()
-        response["processing_time_seconds"] = round(processing_time, 2)
-        response["processing_time_formatted"] = f"{int(processing_time // 60)}:{int(processing_time % 60):02d}"
-    
-    if task.get("error"):
-        response["error"] = task["error"]
-    
-    # Add partial results if available
-    if "video_info" in task:
-        response["video_info"] = task["video_info"]
-    if "file_size_mb" in task:
-        response["download_info"] = {
-            "file_size_mb": task["file_size_mb"],
-            "video_path": task.get("video_path")
-        }
-    if "clip_paths" in task:
-        response["clips_info"] = {
-            "clips_created": len(task["clip_paths"]),
-            "clip_paths": task["clip_paths"]
-        }
-    
-    # Add complete result if finished
-    if task["status"] == "completed" and "result" in task:
-        response["result"] = task["result"]
-        response["download_endpoint"] = f"/workflow/download-workflow-result/{task_id}"
-    
-    return response
-
-@router.get("/download-workflow-result/{task_id}")
-async def download_workflow_result(task_id: str, clip_index: Optional[int] = None):
-    """
-    Download results from a completed workflow task
-    If clip_index is specified, download that specific clip, otherwise return the source video
-    """
-    with workflow_task_lock:
-        task = workflow_tasks.get(task_id)
-    
-    if not task:
-        raise HTTPException(status_code=404, detail=f"Workflow task {task_id} not found")
-    
-    if task["status"] != "completed":
-        raise HTTPException(status_code=400, detail=f"Workflow task {task_id} is not completed yet")
-    
-    if "result" not in task:
-        raise HTTPException(status_code=404, detail="Result data not found")
-    
-    result = task["result"]
-    
-    if clip_index is not None:
-        # Download specific clip
-        clip_paths = result["files_created"]["clip_paths"]
-        if clip_index >= len(clip_paths):
-            raise HTTPException(status_code=404, detail=f"Clip index {clip_index} not found")
-        
-        file_path = Path(clip_paths[clip_index])
-        if not file_path.exists():
-            raise HTTPException(status_code=404, detail="Clip file not found")
-        
-        return FileResponse(
-            path=str(file_path),
-            filename=file_path.name,
-            media_type='video/mp4'
-        )
-    else:
-        # Download source video
-        video_path = Path(result["download_info"]["file_path"])
-        if not video_path.exists():
-            raise HTTPException(status_code=404, detail="Source video file not found")
-        
-        return FileResponse(
-            path=str(video_path),
-            filename=video_path.name,
-            media_type='video/mp4'
-        )
-
-@router.get("/workflow-tasks")
-async def list_workflow_tasks():
-    """
-    List all workflow processing tasks
-    """
-    with workflow_task_lock:
-        tasks = {tid: task.copy() for tid, task in workflow_tasks.items()}
-    
-    # Format response
-    formatted_tasks = {}
-    for task_id, task in tasks.items():
-        processing_time = 0
-        if task.get("updated_at") and task.get("created_at"):
-            processing_time = (task["updated_at"] - task["created_at"]).total_seconds()
-        elif task.get("completed_at") and task.get("created_at"):
-            processing_time = (task["completed_at"] - task["created_at"]).total_seconds()
-        
-        formatted_tasks[task_id] = {
-            "status": task["status"],
-            "progress": task["progress"],
-            "current_step": task["current_step"],
-            "message": task["message"],
-            "youtube_url": task["youtube_url"],
-            "settings": {
-                "quality": task["quality"],
-                "create_vertical": task["create_vertical"]
-            },
-            "created_at": task["created_at"].isoformat(),
-            "processing_time_seconds": round(processing_time, 1)
-        }
-    
-    return {
-        "workflow_tasks": formatted_tasks,
-        "total_tasks": len(tasks),
-        "queued": len([t for t in tasks.values() if t["status"] == "queued"]),
-        "processing": len([t for t in tasks.values() if t["status"] == "processing"]),
-        "completed": len([t for t in tasks.values() if t["status"] == "completed"]),
-        "failed": len([t for t in tasks.values() if t["status"] == "failed"])
-    }
-
-@router.post("/cleanup-workflow-tasks")
-async def cleanup_workflow_tasks(max_age_hours: int = 24):
-    """
-    Clean up completed workflow tasks older than specified hours
-    """
-    current_time = datetime.now()
-    to_remove = []
-    
-    with workflow_task_lock:
-        for task_id, task in workflow_tasks.items():
-            if task["status"] in ["completed", "failed"]:
-                completed_at = task.get("completed_at", task.get("created_at"))
-                if completed_at and (current_time - completed_at).total_seconds() > max_age_hours * 3600:
-                    to_remove.append(task_id)
-        
-        for task_id in to_remove:
-            del workflow_tasks[task_id]
-    
-    return {
-        "success": True,
-        "cleaned_tasks": len(to_remove),
-        "remaining_tasks": len(workflow_tasks),
-        "message": f"Cleaned up {len(to_remove)} workflow tasks older than {max_age_hours} hours"
-    }
-
-# Keep the original synchronous endpoint for backward compatibility
-@router.post("/process-complete")
-async def process_video_complete(request: ProcessVideoRequest):
-    """
-    Complete video processing workflow (LEGACY - consider using /process-complete-async)
-    For backward compatibility - this is still async but waits for completion
-    """
-    # Convert to async request and wait for completion
-    async_request = AsyncProcessVideoRequest(**request.dict())
-    
-    # Start the async workflow
-    response = await process_video_complete_async(async_request)
-    task_id = response["task_id"]
-    
-    # Poll for completion (with timeout)
-    max_wait_time = 1800  # 30 minutes max
-    poll_interval = 2  # Check every 2 seconds
-    waited_time = 0
-    
-    while waited_time < max_wait_time:
-        await asyncio.sleep(poll_interval)
-        waited_time += poll_interval
-        
-        status_response = await get_workflow_status(task_id)
-        
-        if status_response["status"] == "completed":
-            return status_response["result"]
-        elif status_response["status"] == "failed":
-            raise HTTPException(status_code=500, detail=status_response.get("error", "Workflow failed"))
-    
-    # If we reach here, it's a timeout
-    raise HTTPException(status_code=408, detail="Workflow timeout - use /process-complete-async for long-running tasks")
-
-@router.post("/download-only")
-async def download_only(request: ProcessVideoRequest):
-    """
-    Download video only in specified quality without processing
-    """
-    url = request.youtube_url
-    quality = request.quality or "best"
-    
-    try:
-        print(f"\n📥 Downloading video: {url}")
-        print(f"🎯 Quality: {quality}")
-        
-        # Get video info first
-        video_info = get_video_info(url)
-        
-        # Download video
-        video_path = download_video(url, quality)
-        file_size_mb = video_path.stat().st_size / (1024*1024)
-        
-        return {
-            "success": True,
-            "video_info": video_info,
-            "download_info": {
-                "quality_requested": quality,
-                "file_size_mb": round(file_size_mb, 1),
-                "file_path": str(video_path)
-            }
-        }
-        
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Download failed: {str(e)}")
-
-@router.post("/analyze-only")
-async def analyze_only(request: ProcessVideoRequest):
-    """
-    Only extract transcript and analyze with Gemini (no download/cutting)
-    """
-    url = request.youtube_url
-    
-    try:
-        print(f"\n🔍 Analyzing video: {url}")
-        
-        # Step 1: Extract transcript
-        video_id = get_video_id(url)
-        raw_transcript_data = fetch_youtube_transcript(video_id)
-        transcript_result = extract_full_transcript(raw_transcript_data)
-        
-        if isinstance(transcript_result, dict) and 'error' in transcript_result:
-            raise HTTPException(status_code=400, detail=f"Transcript error: {transcript_result['error']}")
-        
-        # Step 2: Analyze with Gemini
-        gemini_analysis = await analyze_transcript_with_gemini(transcript_result)
-        
-        return {
-            "success": True,
-            "video_info": {
-                "id": transcript_result.get("id"),
-                "title": transcript_result.get("title"),
-                "category": transcript_result.get("category"),
-                "transcript_length": len(transcript_result.get("transcript", ""))
-            },
-            "analysis": gemini_analysis
-        }
-        
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Analysis failed: {str(e)}")
-
-class VerticalCropRequest(BaseModel):
-    """Request for creating vertical crops from existing video"""
-    video_path: str
-    output_path: Optional[str] = None
-    use_speaker_detection: Optional[bool] = True
-    smoothing_strength: Optional[str] = "very_high"  # low, medium, high, very_high
-
-class AsyncVerticalCropRequest(BaseModel):
-    """Request for async vertical crop processing with smart scene detection"""
-    video_path: str
-    output_path: Optional[str] = None
-    use_speaker_detection: Optional[bool] = True
-    use_smart_scene_detection: Optional[bool] = True
-    scene_content_threshold: Optional[float] = 30.0
-    scene_fade_threshold: Optional[float] = 8.0
-    scene_min_length: Optional[int] = 15
-    ignore_micro_cuts: Optional[bool] = True
-    micro_cut_threshold: Optional[int] = 10
-    smoothing_strength: Optional[str] = "very_high"
-    priority: Optional[str] = "normal"  # low, normal, high
-
-@router.post("/create-vertical-crop-async")
-async def create_vertical_crop_async(request: AsyncVerticalCropRequest):
-    """
-    Create vertical crop asynchronously with smart scene detection and progress tracking
-    Returns immediately with task_id for status polling
-    """
-    try:
-        input_path = Path(request.video_path)
-        if not input_path.exists():
-            raise HTTPException(status_code=404, detail=f"Video file not found: {request.video_path}")
-        
-        # Generate output path if not provided
-        if request.output_path:
-            output_path = Path(request.output_path)
-        else:
-            output_dir = Path("temp_vertical") / "clips"
-            output_dir.mkdir(parents=True, exist_ok=True)
-            smart_suffix = "_smart" if request.use_smart_scene_detection else "_legacy"
-            output_path = output_dir / f"{input_path.stem}_vertical{smart_suffix}.mp4"
-        
-        print(f"🚀 Starting smart async vertical crop: {input_path.name}")
-        print(f"📱 Output: {output_path}")
-        print(f"🎛️ Smoothing: {request.smoothing_strength}")
-        print(f"🔊 Speaker detection: {request.use_speaker_detection}")
-        print(f"🎬 Smart scene detection: {request.use_smart_scene_detection}")
-        if request.use_smart_scene_detection:
-            print(f"   📊 Content threshold: {request.scene_content_threshold}")
-            print(f"   🌅 Fade threshold: {request.scene_fade_threshold}")
-            print(f"   ⏱️ Min scene length: {request.scene_min_length}")
-            print(f"   🔍 Ignore micro-cuts: {request.ignore_micro_cuts} (< {request.micro_cut_threshold} frames)")
-        
-        # Start smart async processing
-        result = await crop_video_to_vertical_async(
-            input_path=input_path,
-            output_path=output_path,
-            use_speaker_detection=request.use_speaker_detection,
-            use_smart_scene_detection=request.use_smart_scene_detection,
-            scene_content_threshold=request.scene_content_threshold,
-            scene_fade_threshold=request.scene_fade_threshold,
-            scene_min_length=request.scene_min_length,
-            ignore_micro_cuts=request.ignore_micro_cuts,
-            micro_cut_threshold=request.micro_cut_threshold,
-            smoothing_strength=request.smoothing_strength
-        )
-        task_id = result["task_id"]
-        
-        return {
-            "success": True,
-            "task_id": task_id,
-            "message": "Smart vertical crop processing started with PySceneDetect",
-            "input_path": str(input_path),
-            "output_path": str(output_path),
-            "smart_features": {
-                "scene_detection_enabled": request.use_smart_scene_detection,
-                "speaker_detection_enabled": request.use_speaker_detection,
-                "scene_content_threshold": request.scene_content_threshold,
-                "scene_fade_threshold": request.scene_fade_threshold,
-                "micro_cut_filtering": request.ignore_micro_cuts,
-                "smoothing_strength": request.smoothing_strength
-            },
-            "status_endpoint": f"/workflow/task-status/{task_id}",
-            "estimated_time": "2-10 minutes depending on video length and scene complexity"
-        }
-        
-    except Exception as e:
-        print(f"❌ Smart async vertical crop failed: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"Failed to start processing: {str(e)}")
-
-@router.get("/task-status/{task_id}")
-async def get_task_status(task_id: str):
-    """
-    Get the status and progress of an async task
-    """
-    task_status = await async_vertical_crop_service.get_task_status(task_id)
-    
-    if not task_status:
-        raise HTTPException(status_code=404, detail=f"Task {task_id} not found")
-    
-    # Add time information
-    created_at = task_status.get("created_at")
-    updated_at = task_status.get("updated_at", created_at)
-    completed_at = task_status.get("completed_at")
-    
-    response = {
-        "task_id": task_id,
-        "status": task_status["status"],
-        "progress": task_status["progress"],
-        "message": task_status["message"],
-        "input_path": task_status["input_path"],
-        "output_path": task_status["output_path"],
-        "created_at": created_at.isoformat() if created_at else None,
-        "updated_at": updated_at.isoformat() if updated_at else None,
-    }
-    
-    if completed_at:
-        response["completed_at"] = completed_at.isoformat()
-        
-        # Calculate processing time
-        if created_at:
-            processing_time = (completed_at - created_at).total_seconds()
-            response["processing_time_seconds"] = round(processing_time, 2)
-    
-    if task_status.get("error"):
-        response["error"] = task_status["error"]
-    
-    # Add file info if completed
-    if task_status["status"] == "completed":
-        output_path = Path(task_status["output_path"])
-        if output_path.exists():
-            file_size_mb = output_path.stat().st_size / (1024*1024)
-            response["output_file_size_mb"] = round(file_size_mb, 2)
-            response["download_endpoint"] = f"/workflow/download-result/{task_id}"
-    
-    return response
-
-@router.get("/download-result/{task_id}")
-async def download_task_result(task_id: str):
-    """
-    Download the result file of a completed task
-    """
-    task_status = await async_vertical_crop_service.get_task_status(task_id)
-    
-    if not task_status:
-        raise HTTPException(status_code=404, detail=f"Task {task_id} not found")
-    
-    if task_status["status"] != "completed":
-        raise HTTPException(status_code=400, detail=f"Task {task_id} is not completed yet")
-    
-    output_path = Path(task_status["output_path"])
-    if not output_path.exists():
-        raise HTTPException(status_code=404, detail="Result file not found")
-    
-    return FileResponse(
-        path=str(output_path),
-        filename=output_path.name,
-        media_type='video/mp4'
-    )
-
-@router.get("/active-tasks")
-async def list_active_tasks():
-    """
-    List all active processing tasks
-    """
-    tasks = await async_vertical_crop_service.list_active_tasks()
-    
-    # Format response
-    formatted_tasks = {}
-    for task_id, task in tasks.items():
-        formatted_tasks[task_id] = {
-            "status": task["status"],
-            "progress": task["progress"],
-            "message": task["message"],
-            "created_at": task["created_at"].isoformat(),
-            "input_file": Path(task["input_path"]).name,
-            "processing_time": (
-                (task.get("updated_at", task["created_at"]) - task["created_at"]).total_seconds()
-                if task.get("updated_at") else 0
-            )
-        }
-    
-    return {
-        "active_tasks": formatted_tasks,
-        "total_tasks": len(tasks),
-        "queued": len([t for t in tasks.values() if t["status"] == "queued"]),
-        "processing": len([t for t in tasks.values() if t["status"] == "processing"]),
-        "completed": len([t for t in tasks.values() if t["status"] == "completed"]),
-        "failed": len([t for t in tasks.values() if t["status"] == "failed"])
-    }
-
-@router.post("/cleanup-tasks")
-async def cleanup_completed_tasks(max_age_hours: int = 24):
-    """
-    Clean up completed tasks older than specified hours
-    """
-    before_count = len(await async_vertical_crop_service.list_active_tasks())
-    await async_vertical_crop_service.cleanup_completed_tasks(max_age_hours)
-    after_count = len(await async_vertical_crop_service.list_active_tasks())
-    
-    cleaned_count = before_count - after_count
-    
-    return {
-        "success": True,
-        "cleaned_tasks": cleaned_count,
-        "remaining_tasks": after_count,
-        "message": f"Cleaned up {cleaned_count} tasks older than {max_age_hours} hours"
-    }
-
-# Update the existing create_vertical_crop endpoint to support both sync and async
-@router.post("/create-vertical-crop")
-async def create_vertical_crop(request: VerticalCropRequest, async_processing: bool = False):
-    """
-    Create vertical crop - supports both sync and async processing
-    """
-    if async_processing:
-        # Redirect to async endpoint
-        async_request = AsyncVerticalCropRequest(**request.dict())
-        return await create_vertical_crop_async(async_request)
-    
-    # ... existing synchronous code ...
-
-@router.post("/test-upload-vertical")
-async def test_upload_vertical(
-    file: UploadFile = File(...),
-    use_speaker_detection: bool = True,
-    use_smart_scene_detection: bool = True,
-    enable_group_conversation_framing: bool = False,
-    scene_content_threshold: float = 30.0,
-    scene_fade_threshold: float = 8.0,
-    scene_min_length: int = 15,
-    ignore_micro_cuts: bool = True,
-    micro_cut_threshold: int = 10,
-    smoothing_strength: str = "very_high",
-    async_processing: bool = True
-):
-    """
-    Test endpoint for uploading a video and creating a smart vertical crop with scene detection.
-    
-    This demonstrates the NEW intelligent scene-aware cropping system where PySceneDetect
-    acts as the "brain" telling your smoothing when to reset for perfect responsiveness
-    on every real cut while maintaining smooth tracking in stable scenes.
-    
-    Args:
-        file: Video file to upload and process
-        use_speaker_detection: Whether to use speaker detection for smart cropping
-        use_smart_scene_detection: Whether to use smart scene detection for crop resets
-        enable_group_conversation_framing: Enable split-screen layout for 2-speaker conversations (top/bottom)
-        scene_content_threshold: Sensitivity for hard cuts (higher = less sensitive, 30.0 = default)
-        scene_fade_threshold: Sensitivity for gradual transitions/fades (8.0 = default)
-        scene_min_length: Minimum scene length in frames to avoid micro-cuts (15 = default)
-        ignore_micro_cuts: Whether to ignore very short scenes (True = recommended)
-        micro_cut_threshold: Threshold for micro-cut detection in frames (10 = default)
-        smoothing_strength: Motion smoothing level ("very_high" = most stable)
-        async_processing: Whether to use async processing (True = recommended for better performance)
-    """
-    try:
-        # Create a temporary file to save the upload
-        with tempfile.NamedTemporaryFile(delete=False, suffix=Path(file.filename).suffix, dir=TEMP_UPLOADS_DIR) as tmp:
-            shutil.copyfileobj(file.file, tmp)
-            temp_path = Path(tmp.name)
-        
-        print(f"📄 Uploaded file saved to temporary path: {temp_path}")
-        print(f"📁 File size: {temp_path.stat().st_size / (1024*1024):.2f} MB")
-
-        # Define the output path for the smart cropped video
-        output_dir = Path("temp_vertical")
-        output_dir.mkdir(exist_ok=True)
-        
-        # Include scene detection info in filename for clarity
-        scene_suffix = "_smart" if use_smart_scene_detection else "_legacy"
-        output_path = output_dir / f"{temp_path.stem}_vertical{scene_suffix}_{smoothing_strength}.mp4"
-        
-        print(f"🎬 Starting SMART vertical crop process...")
-        print(f"   🔊 Speaker detection: {use_speaker_detection}")
-        print(f"   🎬 Smart scene detection: {use_smart_scene_detection}")
-        if use_smart_scene_detection:
-            print(f"   📊 Scene content threshold: {scene_content_threshold}")
-            print(f"   🌅 Scene fade threshold: {scene_fade_threshold}")
-            print(f"   ⏱️ Min scene length: {scene_min_length} frames")
-            print(f"   🔍 Ignore micro-cuts: {ignore_micro_cuts} (< {micro_cut_threshold} frames)")
-        print(f"   🎛️ Smoothing: {smoothing_strength}")
-        print(f"   ⚡ Async processing: {async_processing}")
-
-        if async_processing:
-            # Use the NEW smart async processing system
-            result = await crop_video_to_vertical_async(
-                input_path=temp_path,
-                output_path=output_path,
-                use_speaker_detection=use_speaker_detection,
-                use_smart_scene_detection=use_smart_scene_detection,
-                enable_group_conversation_framing=enable_group_conversation_framing,
-                scene_content_threshold=scene_content_threshold,
-                scene_fade_threshold=scene_fade_threshold,
-                scene_min_length=scene_min_length,
-                ignore_micro_cuts=ignore_micro_cuts,
-                micro_cut_threshold=micro_cut_threshold,
-                smoothing_strength=smoothing_strength
-            )
-            
-            task_id = result["task_id"]
-            
-            print(f"🚀 Smart vertical crop started with task ID: {task_id}")
-            
-            # Clean up temp file (the async process has its own copy)
-            if temp_path.exists():
-                os.remove(temp_path)
-            
-            return {
-                "success": True,
-                "processing_type": "smart_async",
-                "task_id": task_id,
-                "message": "Smart vertical crop processing started with PySceneDetect",
-                "uploaded_file": file.filename,
-                "output_path": str(output_path),
-                "smart_features": {
-                    "scene_detection_enabled": use_smart_scene_detection,
-                    "speaker_detection_enabled": use_speaker_detection,
-                    "group_conversation_framing_enabled": enable_group_conversation_framing,
-                    "scene_content_threshold": scene_content_threshold,
-                    "scene_fade_threshold": scene_fade_threshold,
-                    "micro_cut_filtering": ignore_micro_cuts,
-                    "smoothing_strength": smoothing_strength
-                },
-                "status_endpoint": f"/workflow/task-status/{task_id}",
-                "download_endpoint": f"/workflow/download-result/{task_id}",
-                "estimated_processing_time": "2-10 minutes depending on video length and scene complexity",
-                "scene_detection_info": "Video will be pre-analyzed for scene boundaries before processing",
-                "expected_results": {
-                    "scenes_detected": "Will be available in status after scene analysis",
-                    "smart_resets": "Number of intelligent crop resets at scene cuts",
-                    "cut_boundaries": "Frame numbers where scene changes occur"
-                }
-            }
-        
-        else:
-            # Fallback to synchronous processing (legacy mode)
-            print("⚠️ Using legacy synchronous processing - consider using async_processing=True")
-            
-            # Import the old synchronous function for backward compatibility
-            from app.services.vertical_crop import crop_video_to_vertical as crop_sync
-            
-            success = crop_sync(
-                input_path=temp_path,
-                output_path=output_path,
-                use_speaker_detection=use_speaker_detection,
-                smoothing_strength=smoothing_strength
-            )
-
-            if not success:
-                # Clean up the temp file even on failure
-                os.remove(temp_path)
-                raise HTTPException(status_code=500, detail="Vertical cropping failed during processing")
-
-            print(f"✅ Legacy vertical crop successful! Output at: {output_path}")
-            
-            # Clean up temp file
-            if temp_path.exists():
-                os.remove(temp_path)
-            
-            # Return a downloadable link to the file (legacy mode)
-            return FileResponse(
-                path=output_path, 
-                media_type='video/mp4', 
-                filename=output_path.name
-            )
-
-    except HTTPException:
-        # Re-raise HTTP exceptions to return proper status codes
-        raise
-    except Exception as e:
-        print(f"❌ An error occurred during smart vertical crop test: {e}")
-        # Clean up temp file on any other exception
-        if 'temp_path' in locals() and temp_path.exists():
-            os.remove(temp_path)
-        raise HTTPException(status_code=500, detail=f"An unexpected error occurred: {str(e)}")
-
-@router.post("/test-upload-vertical-legacy")
-async def test_upload_vertical_legacy(
-    file: UploadFile = File(...),
-    use_speaker_detection: bool = True,
-    smoothing_strength: str = "very_high"
-):
-    """
-    LEGACY test endpoint for uploading a video and creating a vertical crop (old system).
-    Use /test-upload-vertical with async_processing=True for the new smart scene detection system.
-    """
-    try:
-        # Create a temporary file to save the upload
-        with tempfile.NamedTemporaryFile(delete=False, suffix=Path(file.filename).suffix, dir=TEMP_UPLOADS_DIR) as tmp:
-            shutil.copyfileobj(file.file, tmp)
-            temp_path = Path(tmp.name)
-        
-        print(f"📄 Uploaded file saved to temporary path: {temp_path}")
-
-        # Define the output path for the cropped video
-        output_dir = Path("temp_vertical")
-        output_dir.mkdir(exist_ok=True)
-        output_path = output_dir / f"{temp_path.stem}_vertical_legacy_{smoothing_strength}.mp4"
-        
-        print(f"🚀 Starting LEGACY vertical crop process...")
-        print(f"   - Speaker detection: {use_speaker_detection}")
-        print(f"   - Smoothing: {smoothing_strength}")
-
-        # Call the OLD vertical cropping service
-        from app.services.vertical_crop import crop_video_to_vertical as crop_sync
-        
-        success = crop_sync(
-            input_path=temp_path,
-            output_path=output_path,
-            use_speaker_detection=use_speaker_detection,
-            smoothing_strength=smoothing_strength
-        )
-
-        if not success:
-            # Clean up the temp file even on failure
-            os.remove(temp_path)
-            raise HTTPException(status_code=500, detail="Vertical cropping failed during processing")
-
-        print(f"✅ Legacy vertical crop successful! Output at: {output_path}")
-        
-        # Clean up temp file
-        if temp_path.exists():
-            os.remove(temp_path)
-        
-        # Return a downloadable link to the file
-        return FileResponse(
-            path=output_path, 
-            media_type='video/mp4', 
-            filename=output_path.name
-        )
-
-    except HTTPException:
-        # Re-raise HTTP exceptions to return proper status codes
-        raise
-    except Exception as e:
-        print(f"❌ An error occurred during legacy vertical crop test: {e}")
-        # Clean up temp file on any other exception
-        if 'temp_path' in locals() and temp_path.exists():
-            os.remove(temp_path)
-        raise HTTPException(status_code=500, detail=f"An unexpected error occurred: {str(e)}")
-
-@router.post("/test-upload-info")
-async def test_upload_info(file: UploadFile = File(...)):
-    """
-    Test endpoint to upload a video and get its info via ffprobe
-    """
-    if not file.filename.lower().endswith('.mp4'):
-        raise HTTPException(
-            status_code=400,
-            detail="Only MP4 files are supported"
-        )
-    
-    try:
-        import cv2
-        
-        # Import filename sanitization function
-        from app.services.youtube import _sanitize_filename
-        
-        # Sanitize the filename to prevent encoding issues
-        safe_filename = _sanitize_filename(file.filename or "upload.mp4")
-        
-        # Save file temporarily
-        upload_dir = Path("temp_uploads")
-        upload_dir.mkdir(exist_ok=True)
-        temp_path = upload_dir / f"info_{safe_filename}"
-        
-        with open(temp_path, "wb") as buffer:
-            content = await file.read()
-            buffer.write(content)
-        
-        # Analyze video with OpenCV
-        cap = cv2.VideoCapture(str(temp_path))
-        
-        if not cap.isOpened():
-            raise HTTPException(status_code=400, detail="Could not open video file. File may be corrupted.")
-        
-        # Get video properties
-        fps = cap.get(cv2.CAP_PROP_FPS)
-        frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-        width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-        height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-        duration = frame_count / fps if fps > 0 else 0
-        
-        cap.release()
-        
-        # Calculate aspect ratio
-        aspect_ratio = width / height if height > 0 else 0
-        orientation = "landscape" if aspect_ratio > 1 else "portrait" if aspect_ratio < 1 else "square"
-        
-        # File size
-        file_size_mb = len(content) / (1024*1024)
-        
-        # Cleanup
-        temp_path.unlink()
-        
-        return {
-            "success": True,
-            "file_info": {
-                "filename": file.filename,
-                "file_size_mb": round(file_size_mb, 2),
-                "duration_seconds": round(duration, 2),
-                "fps": round(fps, 2),
-                "frame_count": frame_count,
-                "resolution": {
-                    "width": width,
-                    "height": height,
-                    "aspect_ratio": round(aspect_ratio, 2),
-                    "orientation": orientation
-                }
-            },
-            "vertical_crop_suitability": {
-                "current_format": f"{width}x{height}",
-                "is_horizontal": orientation == "landscape",
-                "recommended_for_cropping": orientation == "landscape" and width >= 1080,
-                "notes": [
-                    "Horizontal videos work best for vertical cropping",
-                    "Minimum recommended width: 1080px",
-                    "Portrait videos may not crop well"
-                ]
-            }
-        }
-        
-    except ImportError:
-        raise HTTPException(
-            status_code=503,
-            detail="OpenCV not available for video analysis"
-        )
-    except Exception as e:
-        # Cleanup on error
-        if 'temp_path' in locals() and temp_path.exists():
-            temp_path.unlink()
-        
-        raise HTTPException(
-            status_code=500,
-            detail=f"File analysis failed: {str(e)}"
-        )
-
-@router.get("/health")
-async def health_check():
-    """
-    Health check endpoint to confirm the API is running
-    """
-    print("🏥 Health check OK")
-    return {"status": "ok"} 
+        print(f"❌ Failed to start comprehensive workflow: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Failed to start comprehensive workflow: {str(e)}") 

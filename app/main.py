@@ -33,6 +33,8 @@ def read_root():
             "analyze": "/analyze - Analyze transcript with Gemini AI",
             "workflow": {
                 "process_complete": "/workflow/process-complete - Full workflow: transcript → analysis → download → clips",
+                "process_complete_async": "/workflow/process-complete-async - Async version of full workflow",
+                "process_comprehensive_async": "/workflow/process-comprehensive-async - 🚀 ULTIMATE: transcript → gemini → download → vertical crop → burn subtitles (ALL-IN-ONE)",
                 "analyze_only": "/workflow/analyze-only - Only transcript + analysis"
             },
             "subtitles": "/subtitles - Generate subtitles and burn them into video",

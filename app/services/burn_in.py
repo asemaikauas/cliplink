@@ -41,7 +41,7 @@ class BurnInRenderer:
     def _build_force_style(
         self,
         font_size: int = 15,                   # Fixed font size in pixels (much more reliable)
-        font_name: str = "Poppins",            # Bold, thick font for maximum impact
+        font_name: str = "Inter",            # Bold, thick font for maximum impact
         primary_colour: str = "&H00FFFFFF&",   # solid white text
         back_colour: str = "&HE6000000&",      # Very opaque black box
         border_style: int = 1,                 # 1 = outline + drop shadow style
@@ -52,14 +52,13 @@ class BurnInRenderer:
         alignment: int = 2,                    # bottom-centre
         margin_v: int = 50,                    # bottom margin
         bold: int = 1,                         # force bold text (1 = enabled)
-        spacing: float = 2.0                   # spacing between characters (higher = more spaced)
 
     ) -> str:
         """Build ASS subtitle force_style string with improved visibility.
         
         Args:
             font_size: Font size in pixels (15px clean and readable)
-            font_name: Font family name (Poppins for modern look)
+            font_name: Font family name (Inter for modern look)
             primary_colour: Primary text color in ASS format (white)
             back_colour: Background color in ASS format (very opaque black box)
             border_style: Border style (1 = outline + shadow)
@@ -70,7 +69,7 @@ class BurnInRenderer:
             alignment: Text alignment (2 = bottom center)
             margin_v: Bottom margin in pixels
             bold: Bold text flag (1 = enabled)
-            spacing: Character spacing (higher = more spaced out)
+            scale_y: Vertical scaling percentage (90 = 90% height for shorter letters)
             
         Returns:
             Force style string for FFmpeg with enhanced visibility
@@ -87,19 +86,18 @@ class BurnInRenderer:
             f"Shadow={shadow},"
             f"ShadowColour={shadow_colour},"
             f"Bold={bold},"
-            f"Spacing={spacing},"
             f"Alignment={alignment},"
             f"MarginV={margin_v}"
         )
         
         return force_style
-    
+
     def burn_subtitles(
         self,
         video_path: str,
         srt_path: str,
         output_path: str,
-        font_size: int = 15,
+        font_size: int = 14,
         export_codec: str = "h264",
         crf: int = 18,
         task_id: Optional[str] = None
@@ -231,7 +229,7 @@ def burn_subtitles_to_video(
     video_path: str,
     srt_path: str,
     output_path: str,
-    font_size: int = 15,
+    font_size: int = 14,
     export_codec: str = "h264",
     crf: int = 18,
     task_id: Optional[str] = None
@@ -242,7 +240,7 @@ def burn_subtitles_to_video(
         video_path: Path to input video file
         srt_path: Path to SRT subtitle file
         output_path: Path for output video file
-        font_size: Font size in pixels (15px clean and readable)
+        font_size: Font size in pixels (14px clean and readable)
         export_codec: Video codec (h264, h265, etc.)
         crf: Constant Rate Factor for video quality
         task_id: Task ID for logging
