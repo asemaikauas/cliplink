@@ -112,7 +112,7 @@ async def extract_audio_for_transcription(video_path: str, task_id: str) -> str:
 async def create_subtitles(
     video_file: UploadFile = File(..., description="Video file to process"),
     burn_in: bool = Form(True, description="Whether to burn subtitles into video"),
-    font_size_pct: float = Form(4.5, ge=1.0, le=10.0, description="Font size as percentage of video height"),
+    font_size: int = Form(16, ge=12, le=120, description="Font size in pixels"),
     export_codec: str = Form("h264", description="Video codec for output (h264, h265, etc.)"),
     disable_vad: bool = Form(True, description="Disable VAD filtering (enabled by default for better performance)"),
     speech_sync: bool = Form(False, description="Enable true speech synchronization using word-level timestamps"),
@@ -128,7 +128,7 @@ async def create_subtitles(
     Args:
         video_file: Uploaded video file (MP4, MOV, AVI, etc.)
         burn_in: Whether to burn subtitles into the video
-        font_size_pct: Font size as percentage of video height
+        font_size: Font size in pixels
         export_codec: Video codec for output
         disable_vad: Disable VAD filtering (may help with continuous speech)
         background_tasks: FastAPI background tasks
@@ -323,7 +323,7 @@ async def create_subtitles(
                 video_path=temp_video_path,
                 srt_path=srt_path,
                 output_path=burned_video_path,
-                font_size_pct=font_size_pct,
+                font_size=font_size,
                 export_codec=export_codec,
                 task_id=task_id
             )

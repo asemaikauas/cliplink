@@ -49,7 +49,7 @@ curl -X POST "http://localhost:8000/subtitles" \
 curl -X POST "http://localhost:8000/subtitles" \
   -F "video_file=@your_video.mp4" \
   -F "burn_in=true" \
-  -F "font_size_pct=4.5" \
+  -F "font_size=16" \
   -F "export_codec=h264" \
   -F "disable_vad=true" \
   -F "speech_sync=true"

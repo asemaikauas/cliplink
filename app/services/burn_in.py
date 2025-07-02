@@ -40,35 +40,54 @@ class BurnInRenderer:
     
     def _build_force_style(
         self,
-        font_size_pct: float = 4.5,
-        font_name: str = "Inter SemiBold",
-        primary_colour: str = "&Hffffff&",
-        back_colour: str = "&H66000000&",
-        alignment: int = 2,
-        margin_v: int = 40
+        font_size: int = 15,                   # Fixed font size in pixels (much more reliable)
+        font_name: str = "Poppins",            # Bold, thick font for maximum impact
+        primary_colour: str = "&H00FFFFFF&",   # solid white text
+        back_colour: str = "&HE6000000&",      # Very opaque black box
+        border_style: int = 1,                 # 1 = outline + drop shadow style
+        shadow: int = 1,                       # drop shadow for depth
+        shadow_colour: str = "&HA6999999&",    # semi-transparent gray shadow
+        outline: int = 1,                      # thicker black outline for better contrast
+        outline_colour: str = "&H00000000&",   # solid black outline 
+        alignment: int = 2,                    # bottom-centre
+        margin_v: int = 50,                    # bottom margin
+        bold: int = 1,                         # force bold text (1 = enabled)
+        spacing: float = 2.0                   # spacing between characters (higher = more spaced)
+
     ) -> str:
-        """Build ASS subtitle force_style string.
+        """Build ASS subtitle force_style string with improved visibility.
         
         Args:
-            font_size_pct: Font size as percentage of video height
-            font_name: Font family name
-            primary_colour: Primary text color in ASS format
-            back_colour: Background color in ASS format
+            font_size: Font size in pixels (16px is big and readable)
+            font_name: Font family name (Poppins for modern look)
+            primary_colour: Primary text color in ASS format (white)
+            back_colour: Background color in ASS format (very opaque black box)
+            border_style: Border style (1 = outline + shadow)
+            outline: Outline thickness in pixels
+            outline_colour: Outline color (black for contrast)
+            shadow: Shadow distance in pixels
+            shadow_colour: Shadow color (semi-transparent black)
             alignment: Text alignment (2 = bottom center)
             margin_v: Bottom margin in pixels
+            bold: Bold text flag (1 = enabled)
+            spacing: Character spacing (higher = more spaced out)
             
         Returns:
-            Force style string for FFmpeg
+            Force style string for FFmpeg with enhanced visibility
         """
-        # Convert percentage to dynamic font size calculation
-        # We'll use a filter to calculate font size based on video height
-        font_size_expr = f"h*{font_size_pct/100}"
-        
+        # Use fixed font size for reliable results
         force_style = (
             f"Fontname={font_name},"
-            f"Fontsize={font_size_expr},"
+            f"Fontsize={font_size},"
             f"PrimaryColour={primary_colour},"
             f"BackColour={back_colour},"
+            f"BorderStyle={border_style},"
+            f"Outline={outline},"
+            f"OutlineColour={outline_colour},"
+            f"Shadow={shadow},"
+            f"ShadowColour={shadow_colour},"
+            f"Bold={bold},"
+            f"Spacing={spacing},"
             f"Alignment={alignment},"
             f"MarginV={margin_v}"
         )
@@ -80,7 +99,7 @@ class BurnInRenderer:
         video_path: str,
         srt_path: str,
         output_path: str,
-        font_size_pct: float = 4.5,
+        font_size: int = 15,
         export_codec: str = "h264",
         crf: int = 18,
         task_id: Optional[str] = None
@@ -91,7 +110,7 @@ class BurnInRenderer:
             video_path: Path to input video file
             srt_path: Path to SRT subtitle file
             output_path: Path for output video file
-            font_size_pct: Font size as percentage of video height
+            font_size: Font size in pixels (16px is big and readable)
             export_codec: Video codec (h264, h265, etc.)
             crf: Constant Rate Factor for video quality (lower = higher quality)
             task_id: Task ID for logging
@@ -120,7 +139,7 @@ class BurnInRenderer:
                 os.makedirs(output_dir, exist_ok=True)
             
             # Build force style for subtitles
-            force_style = self._build_force_style(font_size_pct=font_size_pct)
+            force_style = self._build_force_style(font_size=font_size)
             
             # Build FFmpeg command
             # Use libx264 for h264, libx265 for h265
@@ -212,7 +231,7 @@ def burn_subtitles_to_video(
     video_path: str,
     srt_path: str,
     output_path: str,
-    font_size_pct: float = 4.5,
+    font_size: int = 15,
     export_codec: str = "h264",
     crf: int = 18,
     task_id: Optional[str] = None
@@ -223,7 +242,7 @@ def burn_subtitles_to_video(
         video_path: Path to input video file
         srt_path: Path to SRT subtitle file
         output_path: Path for output video file
-        font_size_pct: Font size as percentage of video height
+        font_size: Font size in pixels (16px is big and readable)
         export_codec: Video codec (h264, h265, etc.)
         crf: Constant Rate Factor for video quality
         task_id: Task ID for logging
@@ -233,5 +252,5 @@ def burn_subtitles_to_video(
     """
     renderer = BurnInRenderer()
     return renderer.burn_subtitles(
-        video_path, srt_path, output_path, font_size_pct, export_codec, crf, task_id
+        video_path, srt_path, output_path, font_size, export_codec, crf, task_id
     ) 

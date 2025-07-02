@@ -90,7 +90,7 @@ curl -X POST "http://localhost:8000/subtitles" \
   -d '{
     "video_path": "/path/to/video.mp4",
     "burn_in": true,
-    "font_size_pct": 4.5,
+    "font_size": 16,
     "export_codec": "h264"
   }'
 ```
@@ -136,7 +136,7 @@ Response:
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
-| `font_size_pct` | 4.5 | Font size as % of video height |
+| `font_size` | 16 | Font size in pixels |
 | `max_chars_per_line` | 42 | Maximum characters per subtitle line |
 | `max_lines` | 2 | Maximum lines per subtitle |
 | `merge_gap_threshold_ms` | 200 | Merge segments with gaps < 200ms |
