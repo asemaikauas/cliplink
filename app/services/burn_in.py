@@ -47,7 +47,7 @@ class BurnInRenderer:
         border_style: int = 1,                 # 1 = outline + drop shadow style
         shadow: int = 1,                       # drop shadow for depth
         shadow_colour: str = "&HA6999999&",    # semi-transparent gray shadow
-        outline: int = 1,                      # thicker black outline for better contrast
+        outline: int = 1,                      # black outline for better contrast
         outline_colour: str = "&H00000000&",   # solid black outline 
         alignment: int = 2,                    # bottom-centre
         margin_v: int = 50,                    # bottom margin
@@ -58,7 +58,7 @@ class BurnInRenderer:
         """Build ASS subtitle force_style string with improved visibility.
         
         Args:
-            font_size: Font size in pixels (16px is big and readable)
+            font_size: Font size in pixels (15px clean and readable)
             font_name: Font family name (Poppins for modern look)
             primary_colour: Primary text color in ASS format (white)
             back_colour: Background color in ASS format (very opaque black box)
@@ -66,7 +66,7 @@ class BurnInRenderer:
             outline: Outline thickness in pixels
             outline_colour: Outline color (black for contrast)
             shadow: Shadow distance in pixels
-            shadow_colour: Shadow color (semi-transparent black)
+            shadow_colour: Shadow color (semi-transparent gray)
             alignment: Text alignment (2 = bottom center)
             margin_v: Bottom margin in pixels
             bold: Bold text flag (1 = enabled)
@@ -110,7 +110,7 @@ class BurnInRenderer:
             video_path: Path to input video file
             srt_path: Path to SRT subtitle file
             output_path: Path for output video file
-            font_size: Font size in pixels (16px is big and readable)
+            font_size: Font size in pixels (15px clean and readable)
             export_codec: Video codec (h264, h265, etc.)
             crf: Constant Rate Factor for video quality (lower = higher quality)
             task_id: Task ID for logging
@@ -242,7 +242,7 @@ def burn_subtitles_to_video(
         video_path: Path to input video file
         srt_path: Path to SRT subtitle file
         output_path: Path for output video file
-        font_size: Font size in pixels (16px is big and readable)
+        font_size: Font size in pixels (15px clean and readable)
         export_codec: Video codec (h264, h265, etc.)
         crf: Constant Rate Factor for video quality
         task_id: Task ID for logging
