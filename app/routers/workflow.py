@@ -584,7 +584,7 @@ async def _process_video_workflow_async(
                 "message": f"Comprehensive workflow failed: {str(e)}",
                 "completed_at": datetime.now()
             })
-        raise e 
+        raise e
 
 @router.post("/process-comprehensive-async")
 async def process_comprehensive_workflow_async(request: ComprehensiveWorkflowRequest):
