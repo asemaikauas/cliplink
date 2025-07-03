@@ -30,6 +30,9 @@ except Exception as e:
     print(f"⚠️ FFmpeg configuration warning: {e}")
     print("🔧 MoviePy will try to use system ffmpeg")
 
+# Setup logging
+logger = logging.getLogger(__name__)
+
 def create_clip_with_direct_ffmpeg(video_path: Path, start: float, end: float, output_path: Path) -> bool:
     """
     Fallback function to create clips using direct ffmpeg calls with proper error handling.
@@ -91,6 +94,15 @@ class YouTubeService:
             'fragment_retries': 10,
         }
 
+        self.quality_map = {
+            "8k": {"force_8k": True},
+            "4k": {"max_height": 2160},
+            "1440p": {"max_height": 1440},
+            "1080p": {"max_height": 1080},
+            "720p": {"max_height": 720},
+            "best": {}
+        }
+
     def get_video_info(self, url: str) -> Dict:
         """
         Extract detailed video information from YouTube URL
@@ -143,6 +155,42 @@ class YouTubeService:
                 
         except Exception as e:
             raise DownloadError(f"Failed to get available formats: {str(e)}")
+
+    def download_video(self, url: str, quality: str = "best") -> Path:
+        """
+        Download a video with a specific quality setting, with a fallback mechanism.
+        Tries the requested quality, and falls back to 'best' if not available.
+        """
+        try:
+            if quality not in self.quality_map:
+                raise ValueError(f"Invalid quality setting: {quality}. Valid options are: {list(self.quality_map.keys())}")
+            
+            logger.info(f"Attempting to download video in requested quality: '{quality}'")
+            return self.download_ultra_hq_video(url, **self.quality_map[quality])
+
+        except DownloadError as e:
+            # Check if the error is due to format unavailability
+            if "Requested format is not available" in str(e):
+                logger.warning(
+                    f"Requested quality '{quality}' not available for {url}. "
+                    f"Falling back to 'best' available quality."
+                )
+                # If the initial attempt was already 'best', don't retry, just re-raise
+                if quality == "best":
+                    raise e
+                
+                # Fallback to the 'best' quality setting
+                try:
+                    return self.download_ultra_hq_video(url, **self.quality_map["best"])
+                except DownloadError as fallback_e:
+                    logger.error(f"Fallback download attempt also failed: {fallback_e}")
+                    raise fallback_e  # Re-raise the exception from the fallback attempt
+            else:
+                # Re-raise other download errors not related to format
+                raise e
+        except Exception as e:
+            logger.error(f"An unexpected error occurred during video download: {e}")
+            raise DownloadError(f"An unexpected error occurred: {e}")
 
     def download_ultra_hq_video(self, url: str, max_height: Optional[int] = None, 
                                 force_8k: bool = False) -> Path:
@@ -216,28 +264,6 @@ class YouTubeService:
         })
         
         return self._download_with_options(url, ydl_opts, video_id)
-
-    def download_video(self, url: str, quality: str = "best") -> Path:
-        """
-        Main download function with quality options
-        
-        Args:
-            url: YouTube video URL
-            quality: "best", "8k", "4k", "1440p", "1080p", "720p"
-        """
-        quality_map = {
-            "8k": {"force_8k": True},
-            "4k": {"max_height": 2160},
-            "1440p": {"max_height": 1440},
-            "1080p": {"max_height": 1080},
-            "720p": {"max_height": 720},
-            "best": {}
-        }
-        
-        if quality not in quality_map:
-            quality = "best"
-        
-        return self.download_ultra_hq_video(url, **quality_map[quality])
 
     def _download_with_options(self, url: str, opts: Dict, video_id: str) -> Path:
         """

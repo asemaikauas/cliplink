@@ -11,6 +11,7 @@ from concurrent.futures import ThreadPoolExecutor
 import uuid
 from datetime import datetime
 import threading
+import time
 
 # Import our services
 from app.services.youtube import (
@@ -117,6 +118,156 @@ def _update_workflow_progress(task_id: str, step: str, progress: int, message: s
             if data:
                 workflow_tasks[task_id].update(data)
 
+# NEW: Fully parallel processing function for a single segment
+async def _process_single_viral_segment_parallel(
+    segment_index: int,
+    segment_data: Dict[str, Any],
+    source_video_path: Path,
+    task_id: str,
+    create_vertical: bool,
+    smoothing_strength: str,
+    burn_subtitles: bool,
+    font_size: int,
+    export_codec: str
+) -> Dict[str, Any]:
+    """
+    Processes a single viral segment in its own parallel task.
+    This includes cutting, vertical cropping, and subtitle burning.
+    """
+    try:
+        start_time_total = time.time()
+        
+        # Unpack segment data
+        start_time = segment_data.get("start")
+        end_time = segment_data.get("end")
+        title = segment_data.get("title", f"Segment_{segment_index+1}")
+        
+        if start_time is None or end_time is None:
+            return {"success": False, "error": "Missing start or end time", "clip_path": None}
+        
+        # --- 1. Cut Clip ---
+        from app.services.youtube import _sanitize_filename, create_clip_with_direct_ffmpeg
+        safe_title = _sanitize_filename(title)
+        
+        # Define clip paths
+        base_dir = source_video_path.parent
+        clips_dir = base_dir / "clips"
+        clips_dir.mkdir(parents=True, exist_ok=True)
+        
+        # We always cut a temporary horizontal clip first
+        temp_horizontal_clip_path = clips_dir / f"temp_{safe_title}_{segment_index+1}.mp4"
+        
+        print(f"🚀 [Segment {segment_index+1}] Starting processing: '{title}'")
+        print(f"   - Cutting segment: {start_time}s - {end_time}s")
+        
+        if not create_clip_with_direct_ffmpeg(source_video_path, start_time, end_time, temp_horizontal_clip_path):
+            raise Exception("Failed to cut video segment using ffmpeg.")
+        
+        processing_clip_path = temp_horizontal_clip_path
+        
+        # --- 2. Vertical Cropping (if enabled) ---
+        if create_vertical:
+            print(f"   - Applying vertical crop with '{smoothing_strength}' smoothing...")
+            vertical_clip_path = clips_dir / f"{safe_title}_vertical.mp4"
+            
+            from app.services.vertical_crop_async import crop_video_to_vertical_async
+            
+            crop_result = await crop_video_to_vertical_async(
+                input_path=temp_horizontal_clip_path,
+                output_path=vertical_clip_path,
+                use_speaker_detection=True,
+                use_smart_scene_detection=True,
+                smoothing_strength=smoothing_strength
+            )
+            
+            if not crop_result.get("success"):
+                raise Exception(f"Vertical cropping failed: {crop_result.get('error')}")
+            
+            processing_clip_path = vertical_clip_path
+            # Clean up the temp horizontal clip now that we have the vertical one
+            if temp_horizontal_clip_path.exists():
+                temp_horizontal_clip_path.unlink()
+        
+        subtitled_clip_path = None
+        # --- 3. Subtitle Generation & Burning (if enabled) ---
+        if burn_subtitles:
+            print(f"   - Generating and burning subtitles...")
+            
+            # a. Extract audio from the final (cropped) clip
+            from pydub import AudioSegment
+            temp_audio_path = clips_dir / f"temp_audio_{safe_title}_{segment_index+1}.wav"
+            audio = AudioSegment.from_file(str(processing_clip_path))
+            audio = audio.set_frame_rate(16000).set_channels(1)
+            audio.export(temp_audio_path, format="wav")
+            
+            # b. Transcribe the audio
+            from app.services.groq_client import transcribe
+            transcription_result = transcribe(
+                file_path=str(temp_audio_path),
+                apply_vad=True,
+                task_id=f"{task_id}_clip_{segment_index}"
+            )
+            
+            if temp_audio_path.exists():
+                temp_audio_path.unlink()
+            
+            if not transcription_result or not transcription_result.get("segments"):
+                print(f"⚠️ [Segment {segment_index+1}] No transcription found. Skipping subtitle burn.")
+            else:
+                # c. Convert transcription to SRT
+                from app.services.subs import convert_groq_to_subtitles
+                subtitles_dir = clips_dir / "subtitles"
+                subtitles_dir.mkdir(exist_ok=True)
+                
+                srt_path, _ = await _run_blocking_task(
+                    convert_groq_to_subtitles,
+                    groq_segments=transcription_result["segments"],
+                    word_timestamps=transcription_result.get("word_timestamps", []),
+                    output_dir=str(subtitles_dir),
+                    filename_base=f"clip_{segment_index+1}_{safe_title}",
+                    speech_sync_mode=True
+                )
+                
+                # d. Burn subtitles
+                if srt_path and Path(srt_path).exists():
+                    from app.services.burn_in import burn_subtitles_to_video
+                    subtitled_clip_path = clips_dir / f"subtitled_{processing_clip_path.name}"
+                    
+                    await _run_blocking_task(
+                        burn_subtitles_to_video,
+                        video_path=str(processing_clip_path),
+                        srt_path=srt_path,
+                        output_path=str(subtitled_clip_path),
+                        font_size=font_size,
+                        export_codec=export_codec
+                    )
+                    
+                    if subtitled_clip_path.exists():
+                        # We have a new subtitled clip, remove the non-subtitled one
+                        processing_clip_path.unlink()
+                    else:
+                        subtitled_clip_path = None # Burn-in failed
+                else:
+                    print(f"⚠️ [Segment {segment_index+1}] SRT file generation failed. Skipping burn.")
+
+        final_clip_path = subtitled_clip_path if subtitled_clip_path else processing_clip_path
+
+        total_time = time.time() - start_time_total
+        print(f"✅ [Segment {segment_index+1}] Finished processing in {total_time:.2f}s. Final file: {final_clip_path.name}")
+        
+        return {
+            "success": True, 
+            "clip_path": str(final_clip_path),
+            "has_subtitles": "subtitled_" in final_clip_path.name,
+            "processing_time": total_time
+        }
+        
+    except Exception as e:
+        import traceback
+        print(f"❌ [Segment {segment_index+1}] Processing failed: {e}")
+        print(traceback.format_exc())
+        return {"success": False, "error": str(e), "clip_path": None}
+
 async def _process_video_workflow_async(
     task_id: str,
     youtube_url: str,
@@ -201,298 +352,60 @@ async def _process_video_workflow_async(
         except DownloadError as e:
             raise Exception(f"Download failed: {str(e)}")
         
-        # Step 5: Cut clips with vertical cropping (60-75%)
-        _update_workflow_progress(task_id, "cutting", 60, "✂️ Cutting and processing video clips...")
+        # --- REFACTORED Steps 5, 6, 7: Parallel Processing of Viral Segments ---
+        _update_workflow_progress(task_id, "parallel_processing", 60, f"🚀 Starting parallel processing for {len(viral_segments)} viral segments...")
         
-        try:
-            if create_vertical:
-                _update_workflow_progress(task_id, "cutting", 62, f"Creating vertical clips directly with {smoothing_strength} smoothing...")
-                
-                # Use the more efficient vertical cutting approach that combines cutting and cropping
-                from app.services.vertical_crop_async import crop_video_to_vertical_async
-                
-                # Process each viral segment directly to vertical clips
-                clip_paths = []
-                
-                for i, segment in enumerate(viral_segments):
-                    progress = 62 + (i / len(viral_segments)) * 13  # 62-75%
-                    _update_workflow_progress(
-                        task_id, "cutting", int(progress), 
-                        f"Creating vertical clip {i+1}/{len(viral_segments)}: {segment.get('title', f'Segment {i+1}')}"
-                    )
-                    
-                    start_time = segment.get("start")
-                    end_time = segment.get("end")
-                    title = segment.get("title", f"Segment_{i+1}")
-                    
-                    if start_time is None or end_time is None:
-                        continue
-                    
-                    # Create safe filename
-                    from app.services.youtube import _sanitize_filename
-                    safe_title = _sanitize_filename(title)
-                    
-                    # Create output directory
-                    clips_dir = video_path.parent / "clips" / "vertical"
-                    clips_dir.mkdir(parents=True, exist_ok=True)
-                    
-                    # Create temporary segment first
-                    temp_segment_path = clips_dir / f"temp_{safe_title}_{i+1}.mp4"
-                    
-                    # Cut the segment using direct ffmpeg
-                    from app.services.youtube import create_clip_with_direct_ffmpeg
-                    if not create_clip_with_direct_ffmpeg(video_path, start_time, end_time, temp_segment_path):
-                        print(f"⚠️ Failed to cut segment {i+1}: {title}")
-                        continue
-                    
-                    # Apply vertical cropping to this segment
-                    vertical_clip_path = clips_dir / f"{safe_title}_vertical.mp4"
-                    
-                    try:
-                        crop_result = await crop_video_to_vertical_async(
-                            input_path=temp_segment_path,
-                            output_path=vertical_clip_path,
-                            use_speaker_detection=True,
-                            use_smart_scene_detection=True,
-                            smoothing_strength=smoothing_strength
-                        )
-                        
-                        if crop_result.get("success") and vertical_clip_path.exists():
-                            clip_paths.append(vertical_clip_path)
-                            print(f"✅ Vertical clip created: {vertical_clip_path.name}")
-                        else:
-                            print(f"⚠️ Failed to create vertical clip for segment {i+1}")
-                    except Exception as e:
-                        print(f"❌ Error creating vertical clip {i+1}: {str(e)}")
-                    finally:
-                        # Clean up temporary segment immediately
-                        if temp_segment_path.exists():
-                            temp_segment_path.unlink()
-                
-            else:
-                _update_workflow_progress(task_id, "cutting", 62, "Creating standard horizontal clips...")
-                clip_paths = await _run_blocking_task(cut_clips, video_path, gemini_analysis)
-            
-            _update_workflow_progress(
-                task_id, "cutting", 75, 
-                f"✅ Clips created: {len(clip_paths)} files",
-                {"clip_paths": [str(p) for p in clip_paths]}
+        parallel_start_time = time.time()
+        
+        tasks = []
+        for i, segment in enumerate(viral_segments):
+            task = _process_single_viral_segment_parallel(
+                segment_index=i,
+                segment_data=segment,
+                source_video_path=video_path,
+                task_id=task_id,
+                create_vertical=create_vertical,
+                smoothing_strength=smoothing_strength,
+                burn_subtitles=burn_subtitles,
+                font_size=font_size,
+                export_codec=export_codec,
             )
-        except Exception as e:
-            raise Exception(f"Clip cutting failed: {str(e)}")
-        
-        # Step 6 & 7: Generate subtitles and burn them per clip (75-95%) - if enabled
-        subtitled_clips = clip_paths  # Default to original clips
-        
-        if burn_subtitles:
-            print(f"📝 Subtitle generation ENABLED - generating subtitles for {len(clip_paths)} individual clips...")
-            _update_workflow_progress(task_id, "per_clip_subtitles", 75, "📝 Generating subtitles for each clip individually...")
+            tasks.append(task)
             
-            try:
-                subtitled_clips = []
-                total_subtitle_segments = 0
-                
-                for i, clip_path in enumerate(clip_paths):
-                    # Progress: 75% + (i/clips * 20%) = 75-95%
-                    base_progress = 75 + (i / len(clip_paths)) * 20
-                    
-                    _update_workflow_progress(
-                        task_id, "per_clip_subtitles", int(base_progress), 
-                        f"📝 Processing clip {i+1}/{len(clip_paths)}: {clip_path.name}"
-                    )
-                    
-                    try:
-                        # Step 6a: Generate subtitles for this specific clip
-                        print(f"📝 Generating subtitles for clip: {clip_path.name}")
-                        
-                        # Extract audio from this clip (same logic as /subtitles endpoint)
-                        from pydub import AudioSegment
-                        temp_audio_path = f"temp_clip_audio_{task_id[:8]}_{i}.wav"
-                        
-                        print(f"🎵 Extracting audio from clip {i+1} for transcription...")
-                        audio = AudioSegment.from_file(str(clip_path))
-                        # Convert to standard format for Groq (16kHz, mono, WAV)
-                        audio = audio.set_frame_rate(16000).set_channels(1)
-                        audio.export(temp_audio_path, format="wav")
-                        
-                        # Get audio duration for logging
-                        duration_s = len(audio) / 1000.0
-                        print(f"✅ Audio extracted: {duration_s:.1f}s")
-                        
-                        # Transcribe this clip's audio with VAD enabled and retry logic
-                        print(f"🎤 Starting transcription with Groq Whisper large-v3 (VAD enabled)...")
-                        
-                        transcription_result = await _run_blocking_task(
-                            transcribe,
-                            file_path=temp_audio_path,
-                            apply_vad=True,  # VAD enabled for better quality
-                            task_id=f"{task_id}_clip_{i}"
-                        )
-                        
-                        # Retry logic from /subtitles endpoint for better results
-                        if len(transcription_result["segments"]) == 0:
-                            print(f"🔄 No segments found with VAD for clip {i+1}, retrying without VAD...")
-                            transcription_result = await _run_blocking_task(
-                                transcribe,
-                                file_path=temp_audio_path,
-                                apply_vad=False,
-                                task_id=f"{task_id}_clip_{i}_retry"
-                            )
-                        elif len(transcription_result["segments"]) < 3:
-                            print(f"🔄 Few segments with VAD for clip {i+1} ({len(transcription_result['segments'])}), trying without VAD...")
-                            retry_result = await _run_blocking_task(
-                                transcribe,
-                                file_path=temp_audio_path,
-                                apply_vad=False,
-                                task_id=f"{task_id}_clip_{i}_retry_few"
-                            )
-                            # Use the result with more segments
-                            if len(retry_result["segments"]) > len(transcription_result["segments"]):
-                                print(f"✅ Better result without VAD: {len(retry_result['segments'])} vs {len(transcription_result['segments'])} segments")
-                                transcription_result = retry_result
-                        
-                        # Clean up temp audio
-                        if Path(temp_audio_path).exists():
-                            Path(temp_audio_path).unlink()
-                        
-                        if not transcription_result or not transcription_result.get("segments"):
-                            print(f"⚠️ No transcription segments for clip {i+1}, skipping subtitles")
-                            subtitled_clips.append(clip_path)
-                            continue
-                        
-                        print(f"✅ Transcription complete: {len(transcription_result['segments'])} segments, language: {transcription_result['language']}")
-                        
-                        # Generate subtitle files for this clip (same logic as /subtitles endpoint)
-                        clip_subtitle_dir = clip_path.parent / "subtitles"
-                        clip_subtitle_dir.mkdir(exist_ok=True)
-                        
-                        print(f"📝 Generating SRT and VTT subtitle files for clip {i+1}...")
-                        
-                        # Configure subtitle processing parameters (same as /subtitles endpoint)
-                        import os
-                        max_chars_per_line = int(os.getenv("SUBTITLE_MAX_CHARS_PER_LINE", 50))
-                        max_lines = int(os.getenv("SUBTITLE_MAX_LINES", 2))
-                        merge_gap_threshold = int(os.getenv("SUBTITLE_MERGE_GAP_MS", 200))
-                        
-                        # CapCut-style parameters from environment
-                        capcut_mode = os.getenv("SUBTITLE_CAPCUT_MODE", "true").lower() == "true"
-                        min_word_duration = int(os.getenv("CAPCUT_MIN_WORD_DURATION_MS", 800))
-                        max_word_duration = int(os.getenv("CAPCUT_MAX_WORD_DURATION_MS", 1500))
-                        word_overlap = int(os.getenv("CAPCUT_WORD_OVERLAP_MS", 150))
-                        
-                        # ENABLE SPEECH SYNC BY DEFAULT (key feature!)
-                        speech_sync = True  # Always enable word-level timestamps for best quality
-                        
-                        # Determine subtitle mode with speech sync priority
-                        if speech_sync:
-                            mode_name = "Speech-synchronized"
-                            actual_capcut_mode = False  # Speech sync takes priority
-                        elif capcut_mode:
-                            mode_name = "CapCut adaptive-word"
-                            actual_capcut_mode = True
-                        else:
-                            mode_name = "Traditional"
-                            actual_capcut_mode = False
-                        
-                        print(f"🎬 Subtitle mode for clip {i+1}: {mode_name} style")
-                        
-                        # Get word timestamps for speech sync
-                        word_timestamps = transcription_result.get("word_timestamps", []) if speech_sync else None
-                        if speech_sync and word_timestamps:
-                            print(f"🎯 Using {len(word_timestamps)} word timestamps for speech sync")
-                        elif speech_sync:
-                            print(f"⚠️ Speech sync requested but no word timestamps available for clip {i+1}, falling back to CapCut mode")
-                            actual_capcut_mode = True
-                        
-                        clip_srt_path, clip_vtt_path = await _run_blocking_task(
-                            convert_groq_to_subtitles,
-                            groq_segments=transcription_result["segments"],
-                            output_dir=str(clip_subtitle_dir),
-                            filename_base=f"clip_{i+1}_{clip_path.stem}",
-                            max_chars_per_line=max_chars_per_line,
-                            max_lines=max_lines,
-                            merge_gap_threshold_ms=merge_gap_threshold,
-                            capcut_mode=actual_capcut_mode,
-                            speech_sync_mode=speech_sync,
-                            word_timestamps=word_timestamps,
-                            min_word_duration_ms=min_word_duration,
-                            max_word_duration_ms=max_word_duration,
-                            word_overlap_ms=word_overlap
-                        )
-                        
-                        if not clip_srt_path or not Path(clip_srt_path).exists():
-                            print(f"⚠️ Failed to generate SRT for clip {i+1}, using original clip")
-                            subtitled_clips.append(clip_path)
-                            continue
-                        
-                        print(f"✅ Subtitles generated for clip {i+1}: {len(transcription_result['segments'])} segments")
-                        total_subtitle_segments += len(transcription_result["segments"])
-                        
-                        # Step 6b: Burn subtitles into this clip
-                        print(f"🔥 Burning subtitles into clip {i+1}...")
-                        
-                        # Create output path for subtitled clip
-                        subtitled_path = clip_path.parent / f"subtitled_{clip_path.name}"
-                        
-                        # Burn clip-specific subtitles
-                        await _run_blocking_task(
-                            burn_subtitles_to_video,
-                            video_path=str(clip_path),
-                            srt_path=clip_srt_path,
-                            output_path=str(subtitled_path),
-                            font_size=font_size,
-                            export_codec=export_codec,
-                            task_id=f"{task_id}_burn_{i}"
-                        )
-                        
-                        if subtitled_path.exists():
-                            subtitled_clips.append(subtitled_path)
-                            print(f"✅ Subtitled clip created: {subtitled_path.name}")
-                        else:
-                            print(f"⚠️ Failed to create subtitled clip: {subtitled_path}")
-                            # Fall back to original clip if subtitle burning fails
-                            subtitled_clips.append(clip_path)
-                            
-                    except Exception as e:
-                        print(f"⚠️ Failed to process subtitles for clip {i+1}: {str(e)}")
-                        # Fall back to original clip if anything fails
-                        subtitled_clips.append(clip_path)
-                        continue
-                
-                subtitled_count = len([p for p in subtitled_clips if 'subtitled_' in str(p)])
-                _update_workflow_progress(
-                    task_id, "per_clip_subtitles", 95, 
-                    f"✅ Per-clip subtitle processing complete: {subtitled_count}/{len(clip_paths)} clips with subtitles",
-                    {
-                        "subtitled_clips": [str(p) for p in subtitled_clips],
-                        "total_subtitle_segments": total_subtitle_segments
-                    }
-                )
-                
-                print(f"✅ Per-clip subtitle processing completed successfully!")
-                print(f"   🎬 Clips processed: {len(clip_paths)}")
-                print(f"   🔥 Subtitled clips created: {subtitled_count}")
-                print(f"   📝 Total subtitle segments: {total_subtitle_segments}")
-                
-            except Exception as e:
-                # If subtitle processing fails, continue with original clips
-                print(f"⚠️ Per-clip subtitle processing failed: {str(e)}")
-                import traceback
-                print(f"🔍 Full per-clip subtitle error traceback: {traceback.format_exc()}")
-                subtitled_clips = clip_paths
-                _update_workflow_progress(
-                    task_id, "per_clip_subtitles", 95, 
-                    f"❌ Per-clip subtitle processing failed, using original clips: {str(e)}",
-                    {"subtitled_clips": [str(p) for p in clip_paths]}
-                )
-        else:
-            _update_workflow_progress(task_id, "per_clip_subtitles", 95, "Skipping per-clip subtitle generation (disabled)")
+        # Run all processing tasks concurrently and wait for them to complete
+        processed_results = await asyncio.gather(*tasks, return_exceptions=True)
+        
+        parallel_duration = time.time() - parallel_start_time
+        print(f"🎬 All parallel processing finished in {parallel_duration:.2f} seconds.")
+
+        # Collect results
+        final_clip_paths = []
+        original_clip_paths_for_result = [] # Keep track of original paths before subtitling for the result
+        successful_clips = 0
+        failed_clips = 0
+        
+        for result in processed_results:
+            if isinstance(result, Exception) or not result.get("success"):
+                failed_clips += 1
+                continue
+            
+            final_clip_paths.append(result["clip_path"])
+            successful_clips += 1
+        
+        # This is a bit tricky, the original paths are now intermediate.
+        # For simplicity, let's just use the final paths for both in the result for now.
+        original_clip_paths_for_result = final_clip_paths
+
+        _update_workflow_progress(
+            task_id, "parallel_processing", 95, 
+            f"✅ Parallel processing complete: {successful_clips} clips created, {failed_clips} failed.",
+            {"clip_paths": final_clip_paths}
+        )
         
         # Step 8: Finalize (95-100%)
         _update_workflow_progress(task_id, "finalizing", 95, "Finalizing comprehensive workflow results...")
         
-        # Prepare final result
-        subtitled_count = len([p for p in subtitled_clips if 'subtitled_' in str(p)])
+        subtitled_count = len([p for p in final_clip_paths if 'subtitled_' in p])
         result = {
             "success": True,
             "workflow_type": "comprehensive",
@@ -534,36 +447,36 @@ async def _process_video_workflow_async(
                 ]
             },
             "subtitle_info": {
-                "subtitle_style": "speech_synchronized" if burn_subtitles else None,  # Always use speech sync
+                "subtitle_style": "speech_synchronized" if burn_subtitles else None,
                 "subtitle_approach": "per_clip_generation_with_word_timestamps" if burn_subtitles else None,
                 "speech_synchronization": True if burn_subtitles else None,
                 "vad_filtering": True if burn_subtitles else None,
                 "clips_with_subtitles": subtitled_count,
-                "total_clips": len(clip_paths),
-                "subtitle_success_rate": f"{(subtitled_count/len(clip_paths)*100):.1f}%" if len(clip_paths) > 0 else "0%",
+                "total_clips": len(final_clip_paths),
+                "subtitle_success_rate": f"{(subtitled_count/len(final_clip_paths)*100):.1f}%" if len(final_clip_paths) > 0 else "0%",
                 "font_size": font_size if burn_subtitles else None,
                 "export_codec": export_codec if burn_subtitles else None
             } if burn_subtitles else None,
             "files_created": {
                 "source_video": str(video_path),
-                "clips_created": len(clip_paths),
-                "original_clip_paths": [str(p) for p in clip_paths],
+                "clips_created": len(final_clip_paths),
+                "original_clip_paths": original_clip_paths_for_result,
                 "subtitled_clips_created": subtitled_count,
-                "final_clip_paths": [str(p) for p in subtitled_clips],
+                "final_clip_paths": final_clip_paths,
                 "clip_type": "vertical" if create_vertical else "horizontal",
                 "has_subtitles": burn_subtitles and subtitled_count > 0,
-                "subtitle_files_location": str(clip_paths[0].parent / "subtitles") if len(clip_paths) > 0 and burn_subtitles else None
+                "subtitle_files_location": str(Path(final_clip_paths[0]).parent / "subtitles") if len(final_clip_paths) > 0 and burn_subtitles else None
             }
         }
         
         # Mark as completed
         with workflow_task_lock:
             if burn_subtitles and subtitled_count > 0:
-                message = f"Comprehensive workflow completed! {len(viral_segments)} segments → {len(clip_paths)} clips → {subtitled_count} clips with subtitles"
+                message = f"Comprehensive workflow completed! {len(viral_segments)} segments → {successful_clips} clips → {subtitled_count} clips with subtitles"
             elif burn_subtitles:
-                message = f"Workflow completed! {len(viral_segments)} segments → {len(clip_paths)} clips (subtitle processing failed)"
+                message = f"Workflow completed! {len(viral_segments)} segments → {successful_clips} clips (subtitle processing failed or not needed on all)"
             else:
-                message = f"Workflow completed! {len(viral_segments)} segments → {len(clip_paths)} clips"
+                message = f"Workflow completed! {len(viral_segments)} segments → {successful_clips} clips"
             
             workflow_tasks[task_id].update({
                 "status": "completed",
