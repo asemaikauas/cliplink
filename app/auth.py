@@ -126,8 +126,8 @@ async def get_current_user(
         payload.get("email_addresses", [{}])[0].get("email_address")
     )
     
-    first_name = payload.get("given_name") or payload.get("first_name", "")
-    last_name = payload.get("family_name") or payload.get("last_name", "")
+    first_name = payload.get("first_name", "")
+    last_name = payload.get("last_name", "")
     
     try:
         # Try to find existing user
