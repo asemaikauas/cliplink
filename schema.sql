@@ -10,9 +10,12 @@ CREATE TYPE video_status AS ENUM ('pending', 'processing', 'done', 'failed');
 -- Users table: Stores registered users of the application
 CREATE TABLE users (
     id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    clerk_id VARCHAR(255) UNIQUE NOT NULL, -- Clerk user ID from JWT sub claim
     email VARCHAR(255) UNIQUE NOT NULL, -- User's email address, must be unique
-    password_hash VARCHAR(255) NOT NULL, -- Hashed password for security
-    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP -- When user registered
+    first_name VARCHAR(255), -- User's first name
+    last_name VARCHAR(255), -- User's last name
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP, -- When user registered
+    updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP -- When user data was last updated
 );
 
 -- Videos table: Metadata about YouTube videos submitted by users

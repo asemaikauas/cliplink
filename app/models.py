@@ -15,6 +15,26 @@ import enum
 Base = declarative_base()
 
 
+class User(Base):
+    """
+    User model representing authenticated users via Clerk
+    
+    Corresponds to the 'users' table in PostgreSQL schema
+    """
+    __tablename__ = "users"
+    
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid4)
+    clerk_id = Column(String(255), unique=True, nullable=False, index=True)
+    email = Column(String(255), unique=True, nullable=False)
+    first_name = Column(String(255), nullable=True)
+    last_name = Column(String(255), nullable=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), index=True)
+    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+    
+    def __repr__(self):
+        return f"<User(id={self.id}, clerk_id={self.clerk_id}, email={self.email})>"
+
+
 class VideoStatus(enum.Enum):
     """Enumeration for video processing status"""
     PENDING = "pending"
