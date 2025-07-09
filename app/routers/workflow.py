@@ -1,4 +1,4 @@
-from fastapi import APIRouter, HTTPException, UploadFile, File, BackgroundTasks
+from fastapi import APIRouter, HTTPException, UploadFile, File, BackgroundTasks, Depends
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
 from typing import Dict, Any, List, Optional
@@ -12,6 +12,7 @@ import uuid
 from datetime import datetime
 import threading
 import time
+from sqlalchemy.ext.asyncio import AsyncSession
 
 # Import our services
 from app.services.youtube import (
@@ -29,6 +30,11 @@ from app.services.vertical_crop_async import (
 from app.services.subs import convert_groq_to_subtitles
 from app.services.burn_in import burn_subtitles_to_video
 from app.services.groq_client import transcribe
+
+# Import authentication and database
+from ..auth import get_current_user
+from ..database import get_db
+from ..models import User, Video, VideoStatus, Clip
 
 router = APIRouter()
 
@@ -603,4 +609,276 @@ async def process_comprehensive_workflow_async(request: ComprehensiveWorkflowReq
         
     except Exception as e:
         print(f"❌ Failed to start comprehensive workflow: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"Failed to start comprehensive workflow: {str(e)}") 
+        raise HTTPException(status_code=500, detail=f"Failed to start comprehensive workflow: {str(e)}")
+
+@router.get("/status/{task_id}")
+async def get_workflow_status(task_id: str, current_user: User = Depends(get_current_user)):
+    """
+    Get the current status of a workflow task
+    
+    Returns the task status, progress, and other metadata.
+    """
+    try:
+        with workflow_task_lock:
+            task_info = workflow_tasks.get(task_id)
+        
+        if not task_info:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Task {task_id} not found"
+            )
+        
+        # Convert datetime objects to ISO strings for JSON serialization
+        response_data = task_info.copy()
+        
+        # Handle datetime conversion
+        for key in ['created_at', 'updated_at', 'completed_at']:
+            if key in response_data and response_data[key]:
+                if isinstance(response_data[key], datetime):
+                    response_data[key] = response_data[key].isoformat()
+        
+        # Map status values to match frontend expectations
+        status_mapping = {
+            'queued': 'pending',
+            'processing': 'processing',
+            'completed': 'done',
+            'failed': 'failed'
+        }
+        
+        if 'status' in response_data:
+            response_data['status'] = status_mapping.get(response_data['status'], response_data['status'])
+        
+        # Ensure we have the required fields for the frontend
+        if 'stage' not in response_data:
+            response_data['stage'] = response_data.get('current_step', 'unknown')
+        
+        return response_data
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to get task status: {str(e)}"
+        )
+
+
+@router.post("/process-video")
+async def process_video_authenticated(
+    request: ProcessVideoRequest,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+    background_tasks: BackgroundTasks = None
+):
+    """
+    Authenticated endpoint to process YouTube videos and create clips
+    
+    This creates a Video record in the database and processes it asynchronously.
+    """
+    try:
+        # Extract YouTube video ID
+        video_id = get_video_id(request.youtube_url)
+        
+        # Get video info first
+        video_info = get_video_info(request.youtube_url)
+        
+        # Create Video record in database
+        from sqlalchemy import select
+        
+        # Check if user already has this video
+        existing_video_query = select(Video).where(
+            Video.user_id == current_user.id,
+            Video.youtube_id == video_id
+        )
+        existing_video_result = await db.execute(existing_video_query)
+        existing_video = existing_video_result.scalar_one_or_none()
+        
+        if existing_video and existing_video.status == VideoStatus.PROCESSING:
+            raise HTTPException(
+                status_code=400,
+                detail="You already have this video being processed. Please wait for it to complete."
+            )
+        
+        # Create or update video record
+        if existing_video:
+            video_record = existing_video
+            video_record.status = VideoStatus.PROCESSING
+        else:
+            video_record = Video(
+                user_id=current_user.id,
+                youtube_id=video_id,
+                title=video_info.get('title', 'Unknown Title'),
+                status=VideoStatus.PROCESSING
+            )
+            db.add(video_record)
+        
+        await db.commit()
+        await db.refresh(video_record)
+        
+        # Generate unique task ID
+        task_id = str(uuid.uuid4())
+        
+        # Initialize task in workflow_tasks
+        with workflow_task_lock:
+            workflow_tasks[task_id] = {
+                "task_id": task_id,
+                "status": "pending",
+                "progress": 0,
+                "stage": "initializing",
+                "message": "Video processing request received",
+                "video_id": str(video_record.id),
+                "user_id": str(current_user.id),
+                "youtube_url": request.youtube_url,
+                "created_at": datetime.now().isoformat(),
+                "error": None,
+                "clip_paths": []
+            }
+        
+        # Start background processing
+        if background_tasks:
+            background_tasks.add_task(
+                _process_video_with_db_updates,
+                task_id=task_id,
+                video_record_id=str(video_record.id),
+                youtube_url=request.youtube_url,
+                quality=request.quality or "best",
+                create_vertical=request.create_vertical or False,
+                smoothing_strength=request.smoothing_strength or "very_high"
+            )
+        else:
+            # Fallback: start in thread pool
+            workflow_executor.submit(
+                asyncio.run,
+                _process_video_with_db_updates(
+                    task_id=task_id,
+                    video_record_id=str(video_record.id),
+                    youtube_url=request.youtube_url,
+                    quality=request.quality or "best",
+                    create_vertical=request.create_vertical or False,
+                    smoothing_strength=request.smoothing_strength or "very_high"
+                )
+            )
+        
+        return {
+            "success": True,
+            "task_id": task_id,
+            "video_id": str(video_record.id),
+            "message": "Video processing started successfully",
+            "status_url": f"/workflow/status/{task_id}"
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        # Update video status to failed if we created one
+        try:
+            if 'video_record' in locals():
+                video_record.status = VideoStatus.FAILED
+                await db.commit()
+        except:
+            pass
+        
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to start video processing: {str(e)}"
+        )
+
+
+async def _process_video_with_db_updates(
+    task_id: str,
+    video_record_id: str,
+    youtube_url: str,
+    quality: str,
+    create_vertical: bool,
+    smoothing_strength: str
+):
+    """
+    Process video and update database records
+    """
+    from ..database import get_db_session
+    
+    db = get_db_session()
+    
+    try:
+        # Update task status
+        _update_workflow_progress(task_id, "starting", 5, "Starting video processing...")
+        
+        # Call the existing comprehensive workflow
+        await _process_video_workflow_async(
+            task_id=task_id,
+            youtube_url=youtube_url,
+            quality=quality,
+            create_vertical=create_vertical,
+            smoothing_strength=smoothing_strength,
+            burn_subtitles=False,
+            font_size=15,
+            export_codec="h264"
+        )
+        
+        # Get the final task result
+        with workflow_task_lock:
+            task_result = workflow_tasks.get(task_id, {})
+        
+        if task_result.get("status") == "done":
+            # Update video status to done
+            from sqlalchemy import select
+            query = select(Video).where(Video.id == video_record_id)
+            result = await db.execute(query)
+            video_record = result.scalar_one_or_none()
+            
+            if video_record:
+                video_record.status = VideoStatus.DONE
+                
+                # Create clip records if we have clip paths
+                clip_paths = task_result.get("clip_paths", [])
+                for i, clip_path in enumerate(clip_paths):
+                    if isinstance(clip_path, Path):
+                        clip_path = str(clip_path)
+                    
+                    # You'll need to extract timing info from the analysis
+                    # For now, using placeholder values
+                    clip_record = Clip(
+                        video_id=video_record.id,
+                        s3_url=clip_path,  # In production, upload to S3 first
+                        start_time=0.0,    # Extract from analysis
+                        end_time=60.0,     # Extract from analysis  
+                        duration=60.0      # Extract from analysis
+                    )
+                    db.add(clip_record)
+                
+                await db.commit()
+        else:
+            # Update video status to failed
+            from sqlalchemy import select
+            query = select(Video).where(Video.id == video_record_id)
+            result = await db.execute(query)
+            video_record = result.scalar_one_or_none()
+            
+            if video_record:
+                video_record.status = VideoStatus.FAILED
+                await db.commit()
+        
+    except Exception as e:
+        # Update video status to failed
+        try:
+            from sqlalchemy import select
+            query = select(Video).where(Video.id == video_record_id)
+            result = await db.execute(query)
+            video_record = result.scalar_one_or_none()
+            
+            if video_record:
+                video_record.status = VideoStatus.FAILED
+                await db.commit()
+        except:
+            pass
+        
+        # Update task status
+        with workflow_task_lock:
+            if task_id in workflow_tasks:
+                workflow_tasks[task_id]["status"] = "failed"
+                workflow_tasks[task_id]["error"] = str(e)
+        
+        print(f"❌ Error in video processing task {task_id}: {str(e)}")
+    
+    finally:
+        await db.close() 
