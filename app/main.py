@@ -8,12 +8,27 @@ and retrieving processed clips.
 
 from fastapi import FastAPI, Depends, HTTPException, status, Query
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, func
 from typing import List, Optional
 from datetime import datetime
 import uvicorn
 import os
+import logging
+
+# Configure logging to suppress status polling noise
+class StatusEndpointFilter(logging.Filter):
+    def filter(self, record):
+        # Filter out GET requests to /workflow/status/ endpoints
+        if hasattr(record, 'args') and record.args:
+            message = record.getMessage()
+            if 'GET /workflow/status/' in message and ' 200 OK' in message:
+                return False
+        return True
+
+# Apply filter to uvicorn access logs
+logging.getLogger("uvicorn.access").addFilter(StatusEndpointFilter())
 
 from .auth import get_current_user, User
 from .database import get_db, init_db, close_db
@@ -46,6 +61,17 @@ app.add_middleware(
     allow_methods=["GET", "POST", "PUT", "DELETE"],
     allow_headers=["*"],
 )
+
+# Static file serving for thumbnails and clips
+import pathlib
+thumbnails_dir = pathlib.Path("downloads/thumbnails")
+thumbnails_dir.mkdir(parents=True, exist_ok=True)
+app.mount("/thumbnails", StaticFiles(directory="downloads/thumbnails"), name="thumbnails")
+
+# Static file serving for clips
+clips_dir = pathlib.Path("downloads/clips")
+clips_dir.mkdir(parents=True, exist_ok=True)
+app.mount("/clips", StaticFiles(directory="downloads/clips"), name="clips")
 
 # Include the video processing routers
 app.include_router(transcript.router, prefix="/transcript", tags=["Transcript"])
@@ -92,7 +118,7 @@ async def health_check(db: AsyncSession = Depends(get_db)):
 async def get_user_videos(
     page: int = Query(1, ge=1, description="Page number"),
     per_page: int = Query(10, ge=1, le=100, description="Items per page"),
-    status: Optional[str] = Query(None, description="Filter by status"),
+    video_status: Optional[str] = Query(None, alias="status", description="Filter by status"),
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db)
 ):
@@ -111,9 +137,9 @@ async def get_user_videos(
         count_query = select(func.count(Video.id)).where(Video.user_id == current_user.id)
         
         # Apply status filter if provided
-        if status:
-            query = query.where(Video.status == status)
-            count_query = count_query.where(Video.status == status)
+        if video_status:
+            query = query.where(Video.status == video_status)
+            count_query = count_query.where(Video.status == video_status)
         
         # Add ordering and pagination
         query = query.order_by(Video.created_at.desc()).offset(offset).limit(per_page)

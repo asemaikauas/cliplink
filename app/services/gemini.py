@@ -114,8 +114,9 @@ async def analyze_transcript_with_gemini(transcript_data: Dict[str, Any]) -> Dic
      {timecodes}
      
      INSTRUCTIONS:
-     Analyze the transcript for viral moments, hooks, and engaging content, create 3-10 short video segments (40 seconds to 2 minutes each), 
-     focus on controversial, surprising, educational, or entertaining moments, use the timecodes to select precise start/end times in seconds. Make sure that 
+     Analyze the transcript for viral moments, hooks, and engaging content, create 3-10 short video segments (40 seconds to 2 minutes each) depending 
+     on the length of the video and truly viral moments, focus on controversial, surprising, educational, or entertaining moments, use the timecodes 
+     to select precise start/end times in seconds. Make sure that 
      selected video segments are not overlappping and tell one story. 
 
      1. Use the transcript + timecodes to pick exact start & end in seconds (floats not allowed).  

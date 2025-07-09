@@ -30,6 +30,8 @@ from app.services.vertical_crop_async import (
 from app.services.subs import convert_groq_to_subtitles
 from app.services.burn_in import burn_subtitles_to_video
 from app.services.groq_client import transcribe
+# Add import for thumbnail generation
+from app.services.thumbnail import generate_thumbnail
 
 # Import authentication and database
 from ..auth import get_current_user
@@ -194,6 +196,27 @@ async def _process_single_viral_segment_parallel(
             if temp_horizontal_clip_path.exists():
                 temp_horizontal_clip_path.unlink()
         
+        # --- 2.5. Thumbnail Generation (after vertical cropping) ---
+        print(f"   - Generating thumbnail...")
+        thumbnails_dir = base_dir / "thumbnails"
+        clip_id = f"clip_{segment_index+1}_{safe_title}"
+        
+        thumbnail_result = await generate_thumbnail(
+            video_path=processing_clip_path,
+            output_dir=thumbnails_dir,
+            clip_id=clip_id,
+            width=300,  # Good size for thumbnails
+            timestamp=1.0  # Extract frame at 1 second
+        )
+        
+        thumbnail_path = None
+        if thumbnail_result.get("success"):
+            # Use relative path for frontend
+            thumbnail_path = f"thumbnails/{thumbnail_result.get('thumbnail_filename')}"
+            print(f"   ✅ Thumbnail generated: {thumbnail_result.get('thumbnail_filename')}")
+        else:
+            print(f"   ⚠️ Thumbnail generation failed: {thumbnail_result.get('error')}")
+        
         subtitled_clip_path = None
         # --- 3. Subtitle Generation & Burning (if enabled) ---
         if burn_subtitles:
@@ -261,9 +284,14 @@ async def _process_single_viral_segment_parallel(
         total_time = time.time() - start_time_total
         print(f"✅ [Segment {segment_index+1}] Finished processing in {total_time:.2f}s. Final file: {final_clip_path.name}")
         
+        # Convert absolute paths to relative URLs for frontend
+        final_clip_relative = str(final_clip_path).replace(str(source_video_path.parent) + "/", "")
+        
         return {
             "success": True, 
-            "clip_path": str(final_clip_path),
+            "clip_path": final_clip_relative,
+            "thumbnail_path": thumbnail_path,
+            "clip_id": clip_id,
             "has_subtitles": "subtitled_" in final_clip_path.name,
             "processing_time": total_time
         }
@@ -387,6 +415,7 @@ async def _process_video_workflow_async(
         # Collect results
         final_clip_paths = []
         original_clip_paths_for_result = [] # Keep track of original paths before subtitling for the result
+        thumbnail_info = []  # Store thumbnail information
         successful_clips = 0
         failed_clips = 0
         
@@ -396,6 +425,15 @@ async def _process_video_workflow_async(
                 continue
             
             final_clip_paths.append(result["clip_path"])
+            
+            # Collect thumbnail information
+            if result.get("thumbnail_path"):
+                thumbnail_info.append({
+                    "clip_id": result.get("clip_id"),
+                    "thumbnail_path": result.get("thumbnail_path"),
+                    "clip_path": result["clip_path"]
+                })
+            
             successful_clips += 1
         
         # This is a bit tricky, the original paths are now intermediate.
@@ -469,6 +507,7 @@ async def _process_video_workflow_async(
                 "original_clip_paths": original_clip_paths_for_result,
                 "subtitled_clips_created": subtitled_count,
                 "final_clip_paths": final_clip_paths,
+                "thumbnails": thumbnail_info,
                 "clip_type": "vertical" if create_vertical else "horizontal",
                 "has_subtitles": burn_subtitles and subtitled_count > 0,
                 "subtitle_files_location": str(Path(final_clip_paths[0]).parent / "subtitles") if len(final_clip_paths) > 0 and burn_subtitles else None
@@ -612,7 +651,7 @@ async def process_comprehensive_workflow_async(request: ComprehensiveWorkflowReq
         raise HTTPException(status_code=500, detail=f"Failed to start comprehensive workflow: {str(e)}")
 
 @router.get("/status/{task_id}")
-async def get_workflow_status(task_id: str, current_user: User = Depends(get_current_user)):
+async def get_workflow_status(task_id: str):
     """
     Get the current status of a workflow task
     
@@ -693,7 +732,7 @@ async def process_video_authenticated(
         existing_video_result = await db.execute(existing_video_query)
         existing_video = existing_video_result.scalar_one_or_none()
         
-        if existing_video and existing_video.status == VideoStatus.PROCESSING:
+        if existing_video and existing_video.status == VideoStatus.PROCESSING.value:
             raise HTTPException(
                 status_code=400,
                 detail="You already have this video being processed. Please wait for it to complete."

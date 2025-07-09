@@ -38,7 +38,7 @@ class User(Base):
 class VideoStatus(enum.Enum):
     """Enumeration for video processing status"""
     PENDING = "pending"
-    PROCESSING = "processing"
+    PROCESSING = "processing" 
     DONE = "done"
     FAILED = "failed"
 

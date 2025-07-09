@@ -134,13 +134,13 @@ async def get_user_stats(
         
         # Count videos by status
         status_counts = {}
-        for status in VideoStatus:
+        for video_status_enum in VideoStatus:
             status_query = select(func.count(Video.id)).where(
                 Video.user_id == current_user.id,
-                Video.status == status
+                Video.status == video_status_enum.value
             )
             status_result = await db.execute(status_query)
-            status_counts[status.value] = status_result.scalar() or 0
+            status_counts[video_status_enum.value] = status_result.scalar() or 0
         
         # Count total clips
         total_clips_query = select(func.count(Clip.id)).join(Video).where(
