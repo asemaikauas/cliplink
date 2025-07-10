@@ -21,10 +21,15 @@ import logging
 class StatusEndpointFilter(logging.Filter):
     def filter(self, record):
         # Filter out GET requests to /workflow/status/ endpoints
-        if hasattr(record, 'args') and record.args:
+        try:
             message = record.getMessage()
-            if 'GET /workflow/status/' in message and ' 200 OK' in message:
+            # Filter status polling requests and health checks
+            if ('GET /workflow/status/' in message or 
+                'GET /workflow/workflow-status/' in message or
+                'GET /health' in message):
                 return False
+        except:
+            pass
         return True
 
 # Apply filter to uvicorn access logs
