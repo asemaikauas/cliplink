@@ -75,10 +75,12 @@ class Clip(Base):
     
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid4)
     video_id = Column(UUID(as_uuid=True), ForeignKey("videos.id", ondelete="CASCADE"), nullable=False, index=True)
-    s3_url = Column(Text, nullable=False)
+    blob_url = Column(Text, nullable=False)  # Azure Blob Storage URL
+    thumbnail_url = Column(Text, nullable=True)  # Thumbnail image URL
     start_time = Column(Float, nullable=False)
     end_time = Column(Float, nullable=False)
     duration = Column(Float, nullable=False)
+    file_size = Column(Float, nullable=True)  # File size in bytes
     created_at = Column(DateTime(timezone=True), server_default=func.now(), index=True)
     
     # Relationships

@@ -26,10 +26,12 @@ class ClipResponse(BaseModel):
     
     id: UUID
     video_id: UUID
-    s3_url: str
+    blob_url: str = Field(description="Azure Blob Storage URL")
+    thumbnail_url: Optional[str] = Field(None, description="Thumbnail image URL")
     start_time: float = Field(description="Start time in seconds")
     end_time: float = Field(description="End time in seconds")
     duration: float = Field(description="Duration in seconds")
+    file_size: Optional[float] = Field(None, description="File size in bytes")
     created_at: datetime
 
 
@@ -81,4 +83,25 @@ class HealthResponse(BaseModel):
     status: str
     service: str
     timestamp: datetime
-    database_connected: bool 
+    database_connected: bool
+
+
+class ClipAccessUrlResponse(BaseModel):
+    """Response model for clip access URL"""
+    clip_id: UUID
+    access_url: str = Field(description="Temporary access URL for the clip")
+    expires_in_hours: int = Field(description="Number of hours until URL expires")
+
+
+class ClipMetadataResponse(BaseModel):
+    """Response model for detailed clip metadata"""
+    clip_id: UUID
+    video_id: UUID
+    start_time: float
+    end_time: float
+    duration: float
+    file_size: Optional[float]
+    created_at: str = Field(description="ISO timestamp")
+    blob_url: str
+    thumbnail_url: Optional[str]
+    azure_metadata: dict = Field(description="Azure Blob Storage metadata") 

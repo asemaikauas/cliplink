@@ -128,6 +128,32 @@ async def download_youtube_video(
             logger.error(f"Unexpected download error (task_id: {task_id}): {str(e)}")
             raise HTTPException(status_code=500, detail=f"Download failed: {str(e)}")
         
+        # Upload video to Azure Blob Storage temporarily
+        azure_blob_url = None
+        try:
+            logger.info(f"☁️ Uploading video to Azure Blob Storage...")
+            
+            # Import and get clip storage service
+            from app.services.clip_storage import get_clip_storage_service
+            clip_storage = await get_clip_storage_service()
+            
+            # Get video ID from info
+            video_id = video_info_dict.get('id', task_id)
+            
+            # Upload video temporarily to Azure (expires in 24 hours)
+            azure_blob_url = await clip_storage.upload_temp_video_for_processing(
+                video_file_path=str(video_path),
+                video_id=video_id,
+                expiry_hours=24
+            )
+            
+            logger.info(f"✅ Video uploaded to Azure: {azure_blob_url}")
+            
+        except Exception as e:
+            logger.warning(f"⚠️ Failed to upload video to Azure Blob Storage: {str(e)}")
+            logger.info(f"📁 Continuing with local file: {video_path}")
+            # Don't fail the request if Azure upload fails, just log it
+        
         # Calculate download metrics
         download_time_ms = int((time.time() - start_time) * 1000)
         file_size_bytes = video_path.stat().st_size
@@ -164,20 +190,30 @@ async def download_youtube_video(
             f"{file_size_mb:.1f}MB in {download_time_ms}ms"
         )
         
+        # Include Azure blob URL in download info if available
+        download_info = {
+            "download_time_ms": download_time_ms,
+            "file_size_bytes": file_size_bytes,
+            "filename": video_path.name,
+            "file_path": str(video_path.absolute()),
+            "quality_settings": {
+                "requested": quality,
+                "actual": actual_quality
+            }
+        }
+        
+        # Add Azure blob URL if upload was successful
+        if azure_blob_url:
+            download_info["azure_blob_url"] = azure_blob_url
+            download_info["storage_location"] = "azure_blob_storage"
+        else:
+            download_info["storage_location"] = "local_only"
+        
         response = YouTubeDownloadResponse(
             task_id=task_id,
             success=True,
             video_info=video_info,
-            download_info={
-                "download_time_ms": download_time_ms,
-                "file_size_bytes": file_size_bytes,
-                "filename": video_path.name,
-                "file_path": str(video_path.absolute()),
-                "quality_settings": {
-                    "requested": quality,
-                    "actual": actual_quality
-                }
-            },
+            download_info=download_info,
             file_path=str(video_path.absolute()),
             file_size_mb=round(file_size_mb, 2),
             quality_requested=quality,

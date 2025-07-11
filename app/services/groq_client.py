@@ -33,7 +33,23 @@ class GroqClient:
         if not self.api_key:
             raise TranscriptionError("GROQ_API_KEY not found in environment variables")
         
-        self.client = groq.Groq(api_key=self.api_key)
+        try:
+            # Try standard initialization
+            self.client = groq.Groq(api_key=self.api_key)
+        except TypeError as e:
+            if "proxies" in str(e):
+                # Handle version compatibility issue with proxies argument
+                logger.warning(f"Groq client initialization error (proxies issue): {e}")
+                try:
+                    # Try without any extra arguments
+                    self.client = groq.Groq(api_key=self.api_key, http_client=None)
+                except:
+                    # Final fallback - try with minimal args
+                    logger.warning("Using fallback Groq client initialization")
+                    self.client = groq.Groq(api_key=self.api_key, base_url="https://api.groq.com")
+            else:
+                raise e
+        
         self.model = "whisper-large-v3"
     
     def _apply_vad_filtering(

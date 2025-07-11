@@ -1,4 +1,4 @@
-from fastapi import APIRouter, HTTPException, UploadFile, File, BackgroundTasks, Depends
+from fastapi import APIRouter, HTTPException, UploadFile, File, BackgroundTasks, Depends, status
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
 from typing import Dict, Any, List, Optional
@@ -32,6 +32,7 @@ from app.services.burn_in import burn_subtitles_to_video
 from app.services.groq_client import transcribe
 # Add import for thumbnail generation
 from app.services.thumbnail import generate_thumbnail
+from app.services.clip_storage import get_clip_storage_service, ClipStorageService
 
 # Import authentication and database
 from ..auth import get_current_user
@@ -284,16 +285,76 @@ async def _process_single_viral_segment_parallel(
         total_time = time.time() - start_time_total
         print(f"✅ [Segment {segment_index+1}] Finished processing in {total_time:.2f}s. Final file: {final_clip_path.name}")
         
+        # --- 4. Upload clip and thumbnail to Azure Blob Storage ---
+        azure_clip_url = None
+        azure_thumbnail_url = None
+        
+        try:
+            print(f"   - Uploading clip to Azure Blob Storage...")
+            
+            # Get clip storage service
+            from app.services.clip_storage import get_clip_storage_service
+            clip_storage = await get_clip_storage_service()
+            
+            # Generate unique blob name for the clip
+            clip_blob_name = f"clips/{safe_title}_{segment_index+1}_{int(time.time())}.mp4"
+            
+            # Upload clip to Azure permanently
+            azure_clip_url = await clip_storage.azure_storage.upload_file(
+                file_path=str(final_clip_path),
+                blob_name=clip_blob_name,
+                container_type="clips",
+                metadata={
+                    "segment_index": str(segment_index),
+                    "title": title,
+                    "start_time": str(start_time),
+                    "end_time": str(end_time),
+                    "duration": str(end_time - start_time),
+                    "has_subtitles": str("subtitled_" in final_clip_path.name),
+                    "is_vertical": str(create_vertical),
+                    "created_at": datetime.utcnow().isoformat()
+                }
+            )
+            
+            print(f"   ✅ Clip uploaded to Azure: {azure_clip_url}")
+            
+            # Upload thumbnail if available
+            if thumbnail_path and Path(base_dir / thumbnail_path).exists():
+                print(f"   - Uploading thumbnail to Azure Blob Storage...")
+                
+                thumbnail_blob_name = f"thumbnails/{safe_title}_{segment_index+1}_{int(time.time())}.jpg"
+                azure_thumbnail_url = await clip_storage.azure_storage.upload_file(
+                    file_path=str(base_dir / thumbnail_path),
+                    blob_name=thumbnail_blob_name,
+                    container_type="thumbnails",
+                    metadata={
+                        "clip_blob_name": clip_blob_name,
+                        "segment_index": str(segment_index),
+                        "title": title,
+                        "created_at": datetime.utcnow().isoformat()
+                    }
+                )
+                
+                print(f"   ✅ Thumbnail uploaded to Azure: {azure_thumbnail_url}")
+            
+        except Exception as e:
+            print(f"   ⚠️ Warning: Failed to upload to Azure Blob Storage: {str(e)}")
+            print(f"   📁 Clip will remain local only: {final_clip_path}")
+            # Don't fail the entire process if Azure upload fails
+        
         # Convert absolute paths to relative URLs for frontend
         final_clip_relative = str(final_clip_path).replace(str(source_video_path.parent) + "/", "")
         
         return {
             "success": True, 
             "clip_path": final_clip_relative,
+            "azure_clip_url": azure_clip_url,
             "thumbnail_path": thumbnail_path,
+            "azure_thumbnail_url": azure_thumbnail_url,
             "clip_id": clip_id,
             "has_subtitles": "subtitled_" in final_clip_path.name,
-            "processing_time": total_time
+            "processing_time": total_time,
+            "storage_location": "azure_blob_storage" if azure_clip_url else "local_only"
         }
         
     except Exception as e:
@@ -368,7 +429,7 @@ async def _process_video_workflow_async(
             {"gemini_analysis": gemini_analysis}
         )
         
-        # Step 4: Download video (40-60%)
+        # Step 4: Download video (40-55%)
         _update_workflow_progress(task_id, "download", 40, f"Downloading video in {quality} quality...")
         
         try:
@@ -376,7 +437,7 @@ async def _process_video_workflow_async(
             file_size_mb = video_path.stat().st_size / (1024*1024)
             
             _update_workflow_progress(
-                task_id, "download", 60, 
+                task_id, "download", 50, 
                 f"Video downloaded: {file_size_mb:.1f} MB",
                 {
                     "video_path": str(video_path),
@@ -385,6 +446,41 @@ async def _process_video_workflow_async(
             )
         except DownloadError as e:
             raise Exception(f"Download failed: {str(e)}")
+        
+        # Step 4.5: Upload video to Azure Blob Storage temporarily (50-60%)
+        _update_workflow_progress(task_id, "azure_upload", 50, "Uploading video to Azure Blob Storage...")
+        
+        try:
+            # Get clip storage service
+            clip_storage = await get_clip_storage_service()
+            
+            # Upload video temporarily to Azure (expires in 24 hours)
+            azure_blob_url = await clip_storage.upload_temp_video_for_processing(
+                video_file_path=str(video_path),
+                video_id=video_id,
+                expiry_hours=24
+            )
+            
+            _update_workflow_progress(
+                task_id, "azure_upload", 60, 
+                f"Video uploaded to Azure Blob Storage: {file_size_mb:.1f} MB",
+                {
+                    "azure_blob_url": azure_blob_url,
+                    "local_video_path": str(video_path),
+                    "file_size_mb": file_size_mb
+                }
+            )
+            
+            print(f"✅ Video uploaded to Azure: {azure_blob_url}")
+            
+        except Exception as e:
+            print(f"⚠️ Warning: Failed to upload video to Azure Blob Storage: {str(e)}")
+            print(f"📁 Continuing with local file: {video_path}")
+            _update_workflow_progress(
+                task_id, "azure_upload", 60, 
+                f"Azure upload failed, using local file: {str(e)}",
+                {"local_video_path": str(video_path)}
+            )
         
         # --- REFACTORED Steps 5, 6, 7: Parallel Processing of Viral Segments ---
         _update_workflow_progress(task_id, "parallel_processing", 60, f"🚀 Starting parallel processing for {len(viral_segments)} viral segments...")
@@ -416,8 +512,10 @@ async def _process_video_workflow_async(
         final_clip_paths = []
         original_clip_paths_for_result = [] # Keep track of original paths before subtitling for the result
         thumbnail_info = []  # Store thumbnail information
+        azure_clips_info = []  # Store Azure Blob Storage information
         successful_clips = 0
         failed_clips = 0
+        azure_uploads_successful = 0
         
         for result in processed_results:
             if isinstance(result, Exception) or not result.get("success"):
@@ -431,8 +529,21 @@ async def _process_video_workflow_async(
                 thumbnail_info.append({
                     "clip_id": result.get("clip_id"),
                     "thumbnail_path": result.get("thumbnail_path"),
+                    "azure_thumbnail_url": result.get("azure_thumbnail_url"),
                     "clip_path": result["clip_path"]
                 })
+            
+            # Collect Azure Blob Storage information
+            if result.get("azure_clip_url"):
+                azure_clips_info.append({
+                    "clip_id": result.get("clip_id"),
+                    "local_path": result["clip_path"],
+                    "azure_clip_url": result.get("azure_clip_url"),
+                    "azure_thumbnail_url": result.get("azure_thumbnail_url"),
+                    "has_subtitles": result.get("has_subtitles", False),
+                    "storage_location": result.get("storage_location", "local_only")
+                })
+                azure_uploads_successful += 1
             
             successful_clips += 1
         
@@ -442,12 +553,24 @@ async def _process_video_workflow_async(
 
         _update_workflow_progress(
             task_id, "parallel_processing", 95, 
-            f"✅ Parallel processing complete: {successful_clips} clips created, {failed_clips} failed.",
-            {"clip_paths": final_clip_paths}
+            f"✅ Parallel processing complete: {successful_clips} clips created, {failed_clips} failed. Azure uploads: {azure_uploads_successful}/{successful_clips}",
+            {"clip_paths": final_clip_paths, "azure_clips_info": azure_clips_info}
         )
         
-        # Step 8: Finalize (95-100%)
+        # Step 8: Finalize and cleanup (95-100%)
         _update_workflow_progress(task_id, "finalizing", 95, "Finalizing comprehensive workflow results...")
+        
+        # Schedule cleanup of temporary video from Azure after processing
+        try:
+            # Get clip storage service if not already available
+            if 'clip_storage' not in locals():
+                clip_storage = await get_clip_storage_service()
+            
+            # Schedule cleanup of temporary video (will be deleted after 24 hours or manually)
+            print(f"📅 Scheduled cleanup of temporary video {video_id} from Azure Blob Storage")
+            
+        except Exception as e:
+            print(f"⚠️ Warning: Failed to schedule Azure cleanup: {str(e)}")
         
         subtitled_count = len([p for p in final_clip_paths if 'subtitled_' in p])
         result = {
@@ -458,6 +581,9 @@ async def _process_video_workflow_async(
                 "transcript_extraction": True,
                 "gemini_analysis": True, 
                 "video_download": True,
+                "azure_upload": True,
+                "clip_processing": True,
+                "azure_clip_uploads": azure_uploads_successful > 0,
                 "subtitle_generation": burn_subtitles and subtitled_count > 0,
                 "clip_cutting": True,
                 "subtitle_burning": burn_subtitles and subtitled_count > 0
@@ -476,7 +602,8 @@ async def _process_video_workflow_async(
             "download_info": {
                 "quality_requested": quality,
                 "file_size_mb": round(file_size_mb, 1),
-                "file_path": str(video_path)
+                "file_path": str(video_path),
+                "azure_blob_url": azure_blob_url if 'azure_blob_url' in locals() else None
             },
             "analysis_results": {
                 "viral_segments_found": len(viral_segments),
@@ -508,20 +635,30 @@ async def _process_video_workflow_async(
                 "subtitled_clips_created": subtitled_count,
                 "final_clip_paths": final_clip_paths,
                 "thumbnails": thumbnail_info,
+                "azure_clips_info": azure_clips_info,
                 "clip_type": "vertical" if create_vertical else "horizontal",
                 "has_subtitles": burn_subtitles and subtitled_count > 0,
                 "subtitle_files_location": str(Path(final_clip_paths[0]).parent / "subtitles") if len(final_clip_paths) > 0 and burn_subtitles else None
+            },
+            "azure_storage_info": {
+                "source_video_uploaded": azure_blob_url if 'azure_blob_url' in locals() else None,
+                "clips_uploaded_to_azure": azure_uploads_successful,
+                "total_clips": successful_clips,
+                "azure_upload_success_rate": f"{(azure_uploads_successful/successful_clips*100):.1f}%" if successful_clips > 0 else "0%",
+                "storage_strategy": "hybrid" if azure_uploads_successful > 0 and azure_uploads_successful < successful_clips else "azure_only" if azure_uploads_successful == successful_clips else "local_only",
+                "azure_containers_used": ["temp_videos", "clips", "thumbnails"] if azure_uploads_successful > 0 else [],
+                "temp_video_cleanup_scheduled": True
             }
         }
         
         # Mark as completed
         with workflow_task_lock:
             if burn_subtitles and subtitled_count > 0:
-                message = f"Comprehensive workflow completed! {len(viral_segments)} segments → {successful_clips} clips → {subtitled_count} clips with subtitles"
+                message = f"Comprehensive workflow completed! {len(viral_segments)} segments → {successful_clips} clips → {subtitled_count} clips with subtitles. Azure uploads: {azure_uploads_successful}/{successful_clips}"
             elif burn_subtitles:
-                message = f"Workflow completed! {len(viral_segments)} segments → {successful_clips} clips (subtitle processing failed or not needed on all)"
+                message = f"Workflow completed! {len(viral_segments)} segments → {successful_clips} clips (subtitle processing failed or not needed on all). Azure uploads: {azure_uploads_successful}/{successful_clips}"
             else:
-                message = f"Workflow completed! {len(viral_segments)} segments → {successful_clips} clips"
+                message = f"Workflow completed! {len(viral_segments)} segments → {successful_clips} clips. Azure uploads: {azure_uploads_successful}/{successful_clips}"
             
             workflow_tasks[task_id].update({
                 "status": "completed",
@@ -921,3 +1058,85 @@ async def _process_video_with_db_updates(
     
     finally:
         await db.close() 
+
+@router.post("/cleanup-temp-video/{video_id}")
+async def cleanup_temp_video(
+    video_id: str,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+    clip_storage: ClipStorageService = Depends(get_clip_storage_service)
+):
+    """
+    Clean up temporary video files after processing is complete
+    
+    This endpoint should be called after all clips have been generated
+    to remove the temporary YouTube video from storage.
+    """
+    try:
+        # Verify user has access to this video
+        from sqlalchemy import select
+        query = select(Video).where(Video.id == video_id)
+        result = await db.execute(query)
+        video = result.scalar_one_or_none()
+        
+        if not video:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Video not found"
+            )
+        
+        if video.user_id != current_user.id:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Access denied to this video"
+            )
+        
+        # Clean up temporary video
+        success = await clip_storage.cleanup_temp_video_after_processing(video_id, db)
+        
+        if success:
+            return {"message": "Temporary video cleaned up successfully"}
+        else:
+            return {"message": "No temporary video found or cleanup failed"}
+            
+    except HTTPException:
+        raise
+    except Exception as e:
+        # Assuming logger is available, otherwise use print
+        # from logging import getLogger
+        # logger = getLogger(__name__)
+        # logger.error(f"Failed to cleanup temp video {video_id}: {str(e)}")
+        print(f"Failed to cleanup temp video {video_id}: {str(e)}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to cleanup temporary video"
+        )
+
+@router.post("/schedule-cleanup")
+async def schedule_temp_cleanup(
+    current_user: User = Depends(get_current_user),
+    clip_storage: ClipStorageService = Depends(get_clip_storage_service)
+):
+    """
+    Run scheduled cleanup of expired temporary videos
+    
+    This is useful for maintenance tasks to clean up any expired temp videos.
+    """
+    try:
+        deleted_count = await clip_storage.schedule_temp_video_cleanup()
+        
+        return {
+            "message": f"Cleanup completed successfully",
+            "deleted_count": deleted_count
+        }
+        
+    except Exception as e:
+        # Assuming logger is available, otherwise use print
+        # from logging import getLogger
+        # logger = getLogger(__name__)
+        # logger.error(f"Scheduled cleanup failed: {str(e)}")
+        print(f"Scheduled cleanup failed: {str(e)}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to run scheduled cleanup"
+        ) 

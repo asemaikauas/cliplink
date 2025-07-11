@@ -47,7 +47,7 @@ from .schemas import (
 )
 
 # Import existing routers for video processing
-from .routers import transcript, workflow, subtitles, users
+from .routers import transcript, workflow, subtitles, users, clips
 
 # Create FastAPI app
 app = FastAPI(
@@ -83,6 +83,7 @@ app.include_router(transcript.router, prefix="/transcript", tags=["Transcript"])
 app.include_router(workflow.router, prefix="/workflow", tags=["Workflow"])
 app.include_router(subtitles.router, prefix="/subtitles", tags=["Subtitles"])
 app.include_router(users.router, prefix="/api/users", tags=["Users"])
+app.include_router(clips.router, prefix="/api", tags=["Clips"])
 
 
 @app.on_event("startup")

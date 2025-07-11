@@ -29,4 +29,22 @@ class BurnInError(SubtitleError):
 
 class VADError(SubtitleError):
     """Raised when Voice Activity Detection fails."""
-    pass 
+    pass
+
+
+class FileUploadError(Exception):
+    """Raised when file upload to Azure Blob Storage fails."""
+    
+    def __init__(self, message: str, file_path: Optional[str] = None):
+        super().__init__(message)
+        self.message = message
+        self.file_path = file_path
+
+
+class FileDownloadError(Exception):
+    """Raised when file download from Azure Blob Storage fails."""
+    
+    def __init__(self, message: str, blob_url: Optional[str] = None):
+        super().__init__(message)
+        self.message = message
+        self.blob_url = blob_url 
