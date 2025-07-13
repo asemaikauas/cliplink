@@ -140,11 +140,11 @@ async def download_youtube_video(
             # Get video ID from info
             video_id = video_info_dict.get('id', task_id)
             
-            # Upload video temporarily to Azure (expires in 24 hours)
+            # Upload video temporarily to Azure (expires in 2 hours)
             azure_blob_url = await clip_storage.upload_temp_video_for_processing(
                 video_file_path=str(video_path),
                 video_id=video_id,
-                expiry_hours=24
+                expiry_hours=2
             )
             
             logger.info(f"✅ Video uploaded to Azure: {azure_blob_url}")
