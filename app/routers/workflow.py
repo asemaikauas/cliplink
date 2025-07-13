@@ -106,6 +106,10 @@ class ComprehensiveWorkflowRequest(BaseModel):
     export_codec: Optional[str] = "h264"  # Video codec (h264, h265)
     priority: Optional[str] = "normal"  # low, normal, high
     notify_webhook: Optional[str] = None  # Optional webhook URL for completion notification
+    
+    # 🔊 NEW AUDIO SYNC OPTIONS
+    enable_audio_sync_fix: Optional[bool] = True  # Enable enhanced audio sync preservation
+    audio_offset_ms: Optional[float] = 0.0  # Manual audio offset correction in milliseconds
 
 class FastWorkflowRequest(BaseModel):
     """Request for fast workflow: skip transcript/Gemini, use provided segments"""
@@ -385,7 +389,9 @@ async def _process_video_workflow_async(
     smoothing_strength: str,
     burn_subtitles: bool = False,
     font_size: int = 15,
-    export_codec: str = "h264"
+    export_codec: str = "h264",
+    enable_audio_sync_fix: bool = True,
+    audio_offset_ms: float = 0.0
 ):
     """
     Async implementation of the complete video processing workflow
@@ -922,6 +928,8 @@ async def process_comprehensive_workflow_async(request: ComprehensiveWorkflowReq
                 "burn_subtitles": request.burn_subtitles,
                 "font_size": request.font_size,
                 "export_codec": request.export_codec,
+                "enable_audio_sync_fix": request.enable_audio_sync_fix,
+                "audio_offset_ms": request.audio_offset_ms,
                 "speech_synchronization": True,  # Always enabled
                 "vad_filtering": True,  # Always enabled
                 "priority": request.priority or "normal",
@@ -946,7 +954,9 @@ async def process_comprehensive_workflow_async(request: ComprehensiveWorkflowReq
             request.smoothing_strength or "very_high",
             request.burn_subtitles or False,
             request.font_size or 15,
-            request.export_codec or "h264"
+            request.export_codec or "h264",
+            request.enable_audio_sync_fix,
+            request.audio_offset_ms
         ))
         
         return {
@@ -963,7 +973,9 @@ async def process_comprehensive_workflow_async(request: ComprehensiveWorkflowReq
                 "speech_synchronization": True,
                 "vad_filtering": True,
                 "font_size": request.font_size or 15,
-                "export_codec": request.export_codec or "h264"
+                "export_codec": request.export_codec or "h264",
+                "enable_audio_sync_fix": request.enable_audio_sync_fix,
+                "audio_offset_ms": request.audio_offset_ms
             },
             "workflow_steps": [
                 "1. Video info extraction",

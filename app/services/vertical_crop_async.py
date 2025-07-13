@@ -871,13 +871,36 @@ class AsyncVerticalCropService:
             logger.error(f"❌ Full error details: ", exc_info=True)
             return {"success": False, "error": str(e)}
     
-    async def _add_audio_to_video(
-        self, 
-        temp_video_path: Path, 
-        input_video_path: Path, 
-        output_video_path: Path
-    ) -> bool:
-        """Add audio to video using ffmpeg (async)"""
+    async def _add_audio_to_video(self, temp_video_path: Path, input_video_path: Path, output_video_path: Path) -> bool:
+        """Add audio back to processed video with enhanced sync preservation"""
+        try:
+            from .audio_sync_manager import get_audio_sync_manager
+            
+            # Use the enhanced audio sync manager
+            sync_manager = await get_audio_sync_manager()
+            
+            logger.info("🔊 Using enhanced audio sync manager for audio merge...")
+            
+            # Apply the vertical crop audio fix
+            success = await sync_manager.fix_vertical_crop_audio(
+                temp_video_path, input_video_path, output_video_path, preserve_timing=True
+            )
+            
+            if success:
+                # Clean up temp file
+                if temp_video_path.exists():
+                    os.remove(temp_video_path)
+                return True
+            else:
+                logger.warning("Enhanced audio sync failed, trying fallback...")
+                return await self._fallback_audio_merge(temp_video_path, input_video_path, output_video_path)
+                
+        except Exception as e:
+            logger.error(f"Enhanced audio merge error: {e}")
+            return await self._fallback_audio_merge(temp_video_path, input_video_path, output_video_path)
+    
+    async def _fallback_audio_merge(self, temp_video_path: Path, input_video_path: Path, output_video_path: Path) -> bool:
+        """Fallback audio merge with basic sync preservation"""
         try:
             # Check if original has audio
             with VideoFileClip(str(input_video_path)) as original_clip:
@@ -885,14 +908,20 @@ class AsyncVerticalCropService:
                     temp_video_path.rename(output_video_path)
                     return True
             
-            # Use ffmpeg to merge audio
+            # Enhanced ffmpeg command with better sync preservation
             cmd = [
                 'ffmpeg', '-hide_banner', '-loglevel', 'error',
                 '-i', str(temp_video_path),
                 '-i', str(input_video_path),
-                '-c:v', 'copy', '-c:a', 'copy',
+                '-c:v', 'copy', 
+                '-c:a', 'aac',  # Re-encode audio for better compatibility
+                '-b:a', '192k',  # High audio bitrate
+                '-ar', '48000',  # Standard sample rate
                 '-map', '0:v:0', '-map', '1:a:0',
-                '-shortest', str(output_video_path), '-y'
+                '-fflags', '+genpts',  # Generate presentation timestamps
+                '-avoid_negative_ts', 'make_zero',
+                '-movflags', '+faststart',
+                str(output_video_path), '-y'
             ]
             
             # Run ffmpeg asynchronously
@@ -905,16 +934,19 @@ class AsyncVerticalCropService:
             stdout, stderr = await process.communicate()
             
             if process.returncode == 0:
+                # Clean up temp file
+                if temp_video_path.exists():
+                    os.remove(temp_video_path)
                 return True
             else:
-                logger.error(f"ffmpeg error: {stderr.decode()}")
-                # Fallback: rename temp file
+                logger.error(f"Fallback audio merge failed: {stderr.decode()}")
+                # Last resort: rename temp file
                 if temp_video_path.exists():
                     temp_video_path.rename(output_video_path)
                 return False
                 
         except Exception as e:
-            logger.error(f"Audio merge error: {e}")
+            logger.error(f"Fallback audio merge error: {e}")
             if temp_video_path.exists():
                 temp_video_path.rename(output_video_path)
             return False

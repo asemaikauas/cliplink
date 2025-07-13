@@ -92,6 +92,58 @@ class BurnInRenderer:
         
         return force_style
 
+    async def burn_subtitles_async(
+        self,
+        video_path: str,
+        srt_path: str,
+        output_path: str,
+        font_size: int = 14,
+        export_codec: str = "h264",
+        crf: int = 18,
+        task_id: Optional[str] = None
+    ) -> str:
+        """Burn subtitles into video using enhanced sync preservation (async version).
+        
+        Args:
+            video_path: Path to input video file
+            srt_path: Path to SRT subtitle file
+            output_path: Path for output video file
+            font_size: Font size in pixels
+            export_codec: Video codec (h264, h265, etc.)
+            crf: Constant Rate Factor for video quality
+            task_id: Task ID for logging
+            
+        Returns:
+            Path to the output video file
+            
+        Raises:
+            BurnInError: If burn-in process fails
+        """
+        try:
+            from .audio_sync_manager import get_audio_sync_manager
+            
+            logger.info(f"🔊 Starting enhanced subtitle burn-in with sync preservation (task_id: {task_id})")
+            
+            # Use the enhanced audio sync manager
+            sync_manager = await get_audio_sync_manager()
+            
+            success = await sync_manager.fix_subtitle_burn_sync(
+                video_path, srt_path, output_path, font_size, export_codec, crf
+            )
+            
+            if success:
+                logger.info(f"✅ Enhanced subtitle burn-in completed: {output_path}")
+                return output_path
+            else:
+                # Fallback to original method
+                logger.warning("Enhanced subtitle burn failed, using fallback method...")
+                return self.burn_subtitles(video_path, srt_path, output_path, font_size, export_codec, crf, task_id)
+                
+        except Exception as e:
+            logger.error(f"Enhanced subtitle burn error: {e}")
+            # Fallback to original method
+            return self.burn_subtitles(video_path, srt_path, output_path, font_size, export_codec, crf, task_id)
+    
     def burn_subtitles(
         self,
         video_path: str,
