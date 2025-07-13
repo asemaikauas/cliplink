@@ -33,6 +33,7 @@ from app.services.groq_client import transcribe
 # Add import for thumbnail generation
 from app.services.thumbnail import generate_thumbnail
 from app.services.clip_storage import get_clip_storage_service, ClipStorageService
+from app.services.cleanup import get_cleanup_service, CleanupService
 
 # Import authentication and database
 from ..auth import get_current_user
@@ -95,7 +96,7 @@ class AsyncProcessVideoRequest(BaseModel):
     notify_webhook: Optional[str] = None  # Optional webhook URL for completion notification
 
 class ComprehensiveWorkflowRequest(BaseModel):
-    """Request for comprehensive workflow: transcript → gemini → download → vertical crop → burn subtitles with speech sync"""
+    """Request for comprehensive workflow: download → transcript → gemini → vertical crop → burn subtitles → upload to Azure"""
     youtube_url: str
     quality: Optional[str] = "best"  # best, 8k, 4k, 1440p, 1080p, 720p
     create_vertical: Optional[bool] = True  # Create vertical (9:16) clips (default True for comprehensive workflow)
@@ -388,9 +389,10 @@ async def _process_video_workflow_async(
 ):
     """
     Async implementation of the complete video processing workflow
+    NEW ORDER: Download → Transcript → Gemini → Vertical Crop → Burn Subtitles → Upload to Azure
     """
     try:
-        print(f"🚀 Starting comprehensive workflow with settings:")
+        print(f"🚀 Starting comprehensive workflow with NEW ORDER:")
         print(f"   📺 URL: {youtube_url}")
         print(f"   📹 Quality: {quality}")
         print(f"   📱 Create vertical: {create_vertical}")
@@ -399,6 +401,7 @@ async def _process_video_workflow_async(
         print(f"   🎯 Speech synchronization: ENABLED (word-level timestamps)")
         print(f"   🎛️ VAD filtering: ENABLED (with retry logic)")
         print(f"   🎬 Export codec: {export_codec}")
+        print(f"   🔄 Workflow Order: Download → Transcript → Gemini → Vertical Crop → Burn Subtitles → Upload to Azure")
         
         _update_workflow_progress(task_id, "init", 5, f"Starting comprehensive workflow for: {youtube_url}")
         
@@ -412,8 +415,27 @@ async def _process_video_workflow_async(
             {"video_info": video_info}
         )
         
-        # Step 2: Extract transcript (10-25%)
-        _update_workflow_progress(task_id, "transcript", 10, "Extracting transcript...")
+        # Step 2: Download video FIRST (10-25%)
+        _update_workflow_progress(task_id, "download", 10, f"📥 Downloading video in {quality} quality...")
+        
+        try:
+            video_path = await _run_blocking_task(download_video, youtube_url, quality)
+            file_size_mb = video_path.stat().st_size / (1024*1024)
+            
+            _update_workflow_progress(
+                task_id, "download", 25, 
+                f"✅ Video downloaded: {file_size_mb:.1f} MB",
+                {
+                    "video_path": str(video_path),
+                    "file_size_mb": file_size_mb
+                }
+            )
+            print(f"✅ Video downloaded successfully: {video_path} ({file_size_mb:.1f} MB)")
+        except DownloadError as e:
+            raise Exception(f"Download failed: {str(e)}")
+        
+        # Step 3: Extract transcript (25-40%)
+        _update_workflow_progress(task_id, "transcript", 25, "📄 Extracting transcript...")
         video_id = video_info['id']
         
         raw_transcript_data = await _run_blocking_task(fetch_youtube_transcript, video_id)
@@ -423,13 +445,13 @@ async def _process_video_workflow_async(
             raise Exception(f"Transcript error: {transcript_result['error']}")
         
         _update_workflow_progress(
-            task_id, "transcript", 25, 
-            f"Transcript extracted: {len(transcript_result.get('transcript', ''))} characters",
+            task_id, "transcript", 40, 
+            f"✅ Transcript extracted: {len(transcript_result.get('transcript', ''))} characters",
             {"transcript_result": transcript_result}
         )
         
-        # Step 3: Gemini Analysis (25-40%)
-        _update_workflow_progress(task_id, "analysis", 25, "Analyzing with Gemini AI...")
+        # Step 4: Gemini Analysis (40-55%)
+        _update_workflow_progress(task_id, "analysis", 40, "🤖 Analyzing with Gemini AI...")
         gemini_analysis = await analyze_transcript_with_gemini(transcript_result)
         
         if not gemini_analysis.get("gemini_analysis", {}).get("viral_segments"):
@@ -437,66 +459,15 @@ async def _process_video_workflow_async(
         
         viral_segments = gemini_analysis["gemini_analysis"]["viral_segments"]
         _update_workflow_progress(
-            task_id, "analysis", 40, 
-            f"Gemini analysis complete: {len(viral_segments)} segments found",
+            task_id, "analysis", 55, 
+            f"✅ Gemini analysis complete: {len(viral_segments)} segments found",
             {"gemini_analysis": gemini_analysis}
         )
         
-        # Step 4: Download video (40-55%)
-        _update_workflow_progress(task_id, "download", 40, f"Downloading video in {quality} quality...")
+        print(f"✅ Video ready for processing: {video_path} ({file_size_mb:.1f} MB)")
         
-        try:
-            video_path = await _run_blocking_task(download_video, youtube_url, quality)
-            file_size_mb = video_path.stat().st_size / (1024*1024)
-            
-            _update_workflow_progress(
-                task_id, "download", 50, 
-                f"Video downloaded: {file_size_mb:.1f} MB",
-                {
-                    "video_path": str(video_path),
-                    "file_size_mb": file_size_mb
-                }
-            )
-        except DownloadError as e:
-            raise Exception(f"Download failed: {str(e)}")
-        
-        # Step 4.5: Upload video to Azure Blob Storage temporarily (50-60%)
-        _update_workflow_progress(task_id, "azure_upload", 50, "Uploading video to Azure Blob Storage...")
-        
-        try:
-            # Get clip storage service
-            clip_storage = await get_clip_storage_service()
-            
-            # Upload video temporarily to Azure (expires in 2 hours)
-            azure_blob_url = await clip_storage.upload_temp_video_for_processing(
-                video_file_path=str(video_path),
-                video_id=video_id,
-                expiry_hours=2
-            )
-            
-            _update_workflow_progress(
-                task_id, "azure_upload", 60, 
-                f"Video uploaded to Azure Blob Storage: {file_size_mb:.1f} MB",
-                {
-                    "azure_blob_url": azure_blob_url,
-                    "local_video_path": str(video_path),
-                    "file_size_mb": file_size_mb
-                }
-            )
-            
-            print(f"✅ Video uploaded to Azure: {azure_blob_url}")
-            
-        except Exception as e:
-            print(f"⚠️ Warning: Failed to upload video to Azure Blob Storage: {str(e)}")
-            print(f"📁 Continuing with local file: {video_path}")
-            _update_workflow_progress(
-                task_id, "azure_upload", 60, 
-                f"Azure upload failed, using local file: {str(e)}",
-                {"local_video_path": str(video_path)}
-            )
-        
-        # --- REFACTORED Steps 5, 6, 7: Parallel Processing of Viral Segments ---
-        _update_workflow_progress(task_id, "parallel_processing", 60, f"🚀 Starting parallel processing for {len(viral_segments)} viral segments...")
+        # --- Steps 5, 6, 7: Parallel Processing of Viral Segments (Vertical Crop + Burn Subtitles + Upload to Azure) ---
+        _update_workflow_progress(task_id, "parallel_processing", 55, f"🚀 Starting parallel processing for {len(viral_segments)} viral segments...")
         
         parallel_start_time = time.time()
         
@@ -573,17 +544,14 @@ async def _process_video_workflow_async(
         # Step 8: Finalize and cleanup (95-100%)
         _update_workflow_progress(task_id, "finalizing", 95, "Finalizing comprehensive workflow results...")
         
-        # Schedule cleanup of temporary video from Azure after processing
+        # Aggressive cleanup of all temporary files
         try:
-            # Get clip storage service if not already available
-            if 'clip_storage' not in locals():
-                clip_storage = await get_clip_storage_service()
-            
-            # Schedule cleanup of temporary video (will be deleted after 2 hours or manually)
-            print(f"📅 Scheduled cleanup of temporary video {video_id} from Azure Blob Storage")
+            cleanup_service = await get_cleanup_service()
+            await cleanup_service.aggressive_cleanup_after_processing(video_path, task_id)
+            print(f"📅 Aggressive cleanup completed for task {task_id}")
             
         except Exception as e:
-            print(f"⚠️ Warning: Failed to schedule Azure cleanup: {str(e)}")
+            print(f"⚠️ Warning: Failed to perform cleanup: {str(e)}")
         
         subtitled_count = len([p for p in final_clip_paths if 'subtitled_' in p])
         result = {
@@ -594,7 +562,7 @@ async def _process_video_workflow_async(
                 "transcript_extraction": True,
                 "gemini_analysis": True, 
                 "video_download": True,
-                "azure_upload": True,
+                "azure_upload": False,  # Optimized: no redundant temp upload
                 "clip_processing": True,
                 "azure_clip_uploads": azure_uploads_successful > 0,
                 "subtitle_generation": burn_subtitles and subtitled_count > 0,
@@ -806,9 +774,9 @@ async def _process_video_workflow_fast_async(
         
         _update_workflow_progress(task_id, "processing", 90, f"Segment processing complete: {len(successful_results)} successful, {len(failed_results)} failed")
         
-        # Cleanup local video file
-        if video_path.exists():
-            video_path.unlink()
+        # Aggressive cleanup of all temporary files
+        cleanup_service = await get_cleanup_service()
+        await cleanup_service.aggressive_cleanup_after_processing(video_path, task_id)
         
         # Final progress update
         _update_workflow_progress(task_id, "complete", 100, "Fast workflow completed successfully!")
@@ -827,7 +795,7 @@ async def _process_video_workflow_fast_async(
                 "transcript_extraction": False,  # SKIPPED
                 "gemini_analysis": False,  # SKIPPED
                 "video_download": True,
-                "azure_upload": azure_blob_url is not None,
+                "azure_upload": False,  # Optimized: no redundant temp upload
                 "clip_processing": True,
                 "azure_clip_uploads": len(azure_clips_info) > 0,
                 "subtitle_generation": burn_subtitles and subtitled_count > 0
@@ -913,12 +881,13 @@ async def process_comprehensive_workflow_async(request: ComprehensiveWorkflowReq
     """
     🚀 COMPREHENSIVE async workflow that combines EVERYTHING:
     
-    1. 📄 Extract transcript from YouTube URL
-    2. 🤖 Analyze with Gemini AI to find viral segments  
-    3. 📥 Download video in specified quality (supports up to 8K)
+    1. 📥 Download video in specified quality (supports up to 8K)
+    2. 📄 Extract transcript from YouTube URL
+    3. 🤖 Analyze with Gemini AI to find viral segments
     4. ✂️ Cut video into segments based on Gemini analysis with vertical cropping
     5. 📝 Generate subtitles with TRUE SPEECH SYNCHRONIZATION (word-level timestamps)
     6. 🔥 Burn subtitles directly into the final clips with perfect timing
+    7. ☁️ Upload finished clips to Azure Blob Storage
     
     🎯 ADVANCED SUBTITLE FEATURES:
     - Word-level timestamp synchronization for perfect speech alignment
@@ -998,13 +967,14 @@ async def process_comprehensive_workflow_async(request: ComprehensiveWorkflowReq
             },
             "workflow_steps": [
                 "1. Video info extraction",
-                "2. Transcript extraction", 
-                "3. Gemini AI analysis",
-                "4. Video download",
+                "2. Video download",
+                "3. Transcript extraction", 
+                "4. Gemini AI analysis",
                 "5. Vertical clip cutting",
                 "6. Per-clip speech-synchronized subtitle generation",
                 "7. Professional subtitle burning with word-level timing",
-                "8. Final processing"
+                "8. Upload to Azure Blob Storage",
+                "9. Final processing"
             ],
             "status_endpoint": f"/workflow/workflow-status/{task_id}",
             "estimated_time": "10-30 minutes depending on video length and quality"
@@ -1513,4 +1483,58 @@ async def schedule_temp_cleanup(
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Failed to run scheduled cleanup"
+        )
+
+
+@router.post("/aggressive-cleanup")
+async def aggressive_cleanup(
+    max_age_hours: Optional[int] = None,
+    current_user: User = Depends(get_current_user),
+    cleanup_service: CleanupService = Depends(get_cleanup_service)
+):
+    """
+    Run aggressive cleanup of local temporary files
+    
+    This endpoint removes old local files to prevent infinite storage growth.
+    Use this if you notice disk space issues.
+    """
+    try:
+        deleted_count = await cleanup_service.cleanup_old_files(max_age_hours)
+        empty_dirs = await cleanup_service.cleanup_empty_directories()
+        usage = await cleanup_service.get_storage_usage()
+        
+        return {
+            "message": "Aggressive cleanup completed successfully",
+            "deleted_files": deleted_count,
+            "removed_directories": empty_dirs,
+            "current_storage_usage": usage
+        }
+        
+    except Exception as e:
+        print(f"Aggressive cleanup failed: {str(e)}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to run aggressive cleanup"
+        )
+
+
+@router.get("/storage-usage")
+async def get_storage_usage(
+    current_user: User = Depends(get_current_user),
+    cleanup_service: CleanupService = Depends(get_cleanup_service)
+):
+    """
+    Get current local storage usage statistics
+    
+    This endpoint shows how much local storage is being used by temporary files.
+    """
+    try:
+        usage = await cleanup_service.get_storage_usage()
+        return usage
+        
+    except Exception as e:
+        print(f"Failed to get storage usage: {str(e)}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to get storage usage"
         ) 

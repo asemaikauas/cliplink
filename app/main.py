@@ -85,6 +85,16 @@ app.include_router(subtitles.router, prefix="/subtitles", tags=["Subtitles"])
 app.include_router(users.router, prefix="/api/users", tags=["Users"])
 app.include_router(clips.router, prefix="/api", tags=["Clips"])
 
+# Serve React frontend (must be last to catch all routes)
+frontend_dist_path = os.getenv("FRONTEND_DIST_PATH", "/app/frontend/dist")
+if os.path.exists(frontend_dist_path):
+    app.mount("/", StaticFiles(directory=frontend_dist_path, html=True), name="frontend")
+else:
+    # Development fallback
+    @app.get("/")
+    async def root():
+        return {"message": "Cliplink Backend API", "docs": "/docs", "health": "/health"}
+
 
 @app.on_event("startup")
 async def startup():
